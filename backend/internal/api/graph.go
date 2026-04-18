@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/saitenntaisei/better-connected-paper/internal/citation"
+	"github.com/saitenntaisei/better-connected-paper/internal/graph"
 	"github.com/saitenntaisei/better-connected-paper/internal/store"
 )
 
@@ -46,7 +47,20 @@ func (d Deps) BuildGraph(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp, err := d.Builder.Build(r.Context(), seed)
+	build := func() (*graph.Response, error) { return d.Builder.Build(r.Context(), seed) }
+	var (
+		resp *graph.Response
+		err  error
+	)
+	if d.SFlight != nil {
+		v, sErr, _ := d.SFlight.Do("graph:"+seed, func() (any, error) { return build() })
+		if sErr == nil {
+			resp = v.(*graph.Response)
+		}
+		err = sErr
+	} else {
+		resp, err = build()
+	}
 	if errors.Is(err, citation.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "seed paper not found")
 		return

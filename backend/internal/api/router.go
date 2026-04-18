@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"golang.org/x/sync/singleflight"
 )
 
 type Router struct {
@@ -40,7 +41,15 @@ func resolveAllowedOrigins(getenv func(string) string) []string {
 
 // NewRouter wires middleware + all /api/* routes. Any field on deps may be nil;
 // the relevant handler will respond with 503 when its dependency is missing.
+// SFlight and SearchCache are provisioned here (once per process) if the
+// caller didn't supply them, so production wiring and tests stay simple.
 func NewRouter(deps Deps) *Router {
+	if deps.SFlight == nil {
+		deps.SFlight = &singleflight.Group{}
+	}
+	if deps.SearchCache == nil {
+		deps.SearchCache = newSearchCache()
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)

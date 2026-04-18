@@ -55,6 +55,16 @@ func initHandler() {
 	}
 
 	s2 := citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
-	builder := &graph.Builder{S2: s2}
+	builder := &graph.Builder{S2: s2, Cache: graphCache(db)}
 	handler = api.NewRouter(api.Deps{S2: s2, DB: db, Builder: builder})
+}
+
+// graphCache returns the *store.DB as a graph.Cache only when it's non-nil,
+// so the Builder sees a typed-nil-free interface value and its nil checks
+// work as intended.
+func graphCache(db *store.DB) graph.Cache {
+	if db == nil {
+		return nil
+	}
+	return db
 }

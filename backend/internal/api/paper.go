@@ -30,11 +30,42 @@ func (d Deps) Paper(w http.ResponseWriter, r *http.Request) {
 
 	// Try cache first (best-effort).
 	if cached, _ := d.DB.GetPapers(r.Context(), []string{id}); len(cached) == 1 {
+		w.Header().Set("X-Cache", "hit")
 		WriteJSON(w, http.StatusOK, cached[0])
 		return
 	}
 
-	p, err := d.S2.GetPaper(r.Context(), id, paperFields)
+	fetch := func() (*citation.Paper, error) {
+		// Re-check cache inside the singleflight lambda so a follower that
+		// woke up after the leader's upsert still avoids a second S2 hit.
+		if cached, _ := d.DB.GetPapers(r.Context(), []string{id}); len(cached) == 1 {
+			p := cached[0]
+			return &p, nil
+		}
+		p, err := d.S2.GetPaper(r.Context(), id, paperFields)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.DB.UpsertPapers(r.Context(), []citation.Paper{*p}); err != nil {
+			w.Header().Set("X-Cache-Write-Error", err.Error())
+		}
+		return p, nil
+	}
+
+	var (
+		p   *citation.Paper
+		err error
+	)
+	if d.SFlight != nil {
+		v, sErr, _ := d.SFlight.Do("paper:"+id, func() (any, error) { return fetch() })
+		if sErr == nil {
+			p = v.(*citation.Paper)
+		}
+		err = sErr
+	} else {
+		p, err = fetch()
+	}
+
 	if errors.Is(err, citation.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "paper not found")
 		return
@@ -42,11 +73,6 @@ func (d Deps) Paper(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, "semantic scholar: "+err.Error())
 		return
-	}
-
-	if err := d.DB.UpsertPapers(r.Context(), []citation.Paper{*p}); err != nil {
-		// Cache failures shouldn't break the response; log-style write to response headers.
-		w.Header().Set("X-Cache-Write-Error", err.Error())
 	}
 	WriteJSON(w, http.StatusOK, p)
 }

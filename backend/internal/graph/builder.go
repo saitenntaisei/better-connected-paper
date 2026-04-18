@@ -17,9 +17,23 @@ type S2 interface {
 	GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]citation.Paper, error)
 }
 
+// Cache is the subset of store.DB behavior the Builder uses to avoid
+// round-tripping to Semantic Scholar for papers it has already fetched.
+// All methods must tolerate a nil receiver so tests and no-DB deployments
+// can pass a nil Cache and get a straight S2-only path.
+type Cache interface {
+	// GetPapersWithLinks returns cached papers whose refs/cites lists have
+	// been persisted. Missing papers and papers without links come back as
+	// "not in result" so the caller falls back to S2.
+	GetPapersWithLinks(ctx context.Context, ids []string) ([]citation.Paper, error)
+	UpsertPapers(ctx context.Context, papers []citation.Paper) error
+	ReplacePaperLinks(ctx context.Context, paperID string, refs, cites []string) error
+}
+
 // Builder constructs the directed graph around a seed paper.
 type Builder struct {
 	S2        S2
+	Cache     Cache
 	MaxNodes  int           // default 40
 	BatchSize int           // S2 batch cap: 500, we use 100 to keep responses small
 	Timeout   time.Duration // default 90s
@@ -80,7 +94,7 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		now = b.Now
 	}
 
-	seed, err := b.S2.GetPaper(ctx, seedID, seedFields)
+	seed, err := b.fetchSeed(ctx, seedID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch seed: %w", err)
 	}
@@ -92,7 +106,7 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	seedCitedBy := seed.CitedByIDs()
 
 	firstHopIDs := dedupeExcluding(append(append([]string(nil), seedRefs...), seedCitedBy...), seed.PaperID)
-	firstHop, err := b.batchFetch(ctx, firstHopIDs, minimalLinkFields)
+	firstHop, err := b.fetchWithCache(ctx, firstHopIDs, minimalLinkFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetch first hop: %w", err)
 	}
@@ -110,11 +124,12 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		selectedIDs = append(selectedIDs, s.id)
 	}
 
-	full, err := b.batchFetch(ctx, selectedIDs[1:], fullNodeFields)
+	full, err := b.fetchWithCache(ctx, selectedIDs[1:], fullNodeFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
 	fullByID := indexPapers(full)
+	b.persistFetched(ctx, seed, full)
 
 	nodes := make([]Node, 0, len(scored)+1)
 	seedNode := ToNode(*seed)
@@ -191,6 +206,85 @@ func (b *Builder) batchFetch(ctx context.Context, ids []string, fields []string)
 		out = append(out, batch...)
 	}
 	return out, nil
+}
+
+// fetchSeed tries the cache first (requires refs/cites to be persisted)
+// and falls back to S2 GetPaper with the full seedFields.
+func (b *Builder) fetchSeed(ctx context.Context, seedID string) (*citation.Paper, error) {
+	if b.Cache != nil {
+		cached, err := b.Cache.GetPapersWithLinks(ctx, []string{seedID})
+		if err == nil && len(cached) == 1 && cached[0].PaperID == seedID &&
+			(len(cached[0].References) > 0 || len(cached[0].Citations) > 0) {
+			p := cached[0]
+			return &p, nil
+		}
+	}
+	return b.S2.GetPaper(ctx, seedID, seedFields)
+}
+
+// fetchWithCache pulls as many papers as possible from the cache (papers
+// whose links have been persisted) and only routes the remainder through
+// the S2 batch endpoint.
+func (b *Builder) fetchWithCache(ctx context.Context, ids []string, fields []string) ([]citation.Paper, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	out := make([]citation.Paper, 0, len(ids))
+	remaining := ids
+	if b.Cache != nil {
+		cached, err := b.Cache.GetPapersWithLinks(ctx, ids)
+		if err == nil && len(cached) > 0 {
+			have := make(map[string]struct{}, len(cached))
+			for _, p := range cached {
+				if len(p.References) > 0 || len(p.Citations) > 0 {
+					out = append(out, p)
+					have[p.PaperID] = struct{}{}
+				}
+			}
+			if len(have) > 0 {
+				remaining = make([]string, 0, len(ids)-len(have))
+				for _, id := range ids {
+					if _, ok := have[id]; !ok {
+						remaining = append(remaining, id)
+					}
+				}
+			}
+		}
+	}
+	fetched, err := b.batchFetch(ctx, remaining, fields)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, fetched...), nil
+}
+
+// persistFetched stores the freshly-fetched seed + full-node metadata and
+// their ref/cite lists so subsequent builds (and /api/paper/{id} lookups)
+// can be served from Postgres without hitting S2. Cache failures are
+// swallowed — a slow cache must never break the request path.
+func (b *Builder) persistFetched(ctx context.Context, seed *citation.Paper, fullNodes []citation.Paper) {
+	if b.Cache == nil {
+		return
+	}
+	papers := make([]citation.Paper, 0, 1+len(fullNodes))
+	if seed != nil && seed.PaperID != "" {
+		papers = append(papers, *seed)
+	}
+	for _, p := range fullNodes {
+		if p.PaperID != "" && p.Title != "" {
+			papers = append(papers, p)
+		}
+	}
+	if len(papers) == 0 {
+		return
+	}
+	_ = b.Cache.UpsertPapers(ctx, papers)
+	for _, p := range papers {
+		if len(p.References) == 0 && len(p.Citations) == 0 {
+			continue
+		}
+		_ = b.Cache.ReplacePaperLinks(ctx, p.PaperID, p.RefIDs(), p.CitedByIDs())
+	}
 }
 
 // scoredCandidate keeps just the id and score so the "ranked" slice is cheap

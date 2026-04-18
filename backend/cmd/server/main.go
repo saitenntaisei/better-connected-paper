@@ -65,7 +65,11 @@ func main() {
 	}
 
 	s2 := citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
-	builder := &graph.Builder{S2: s2}
+	var cache graph.Cache
+	if db != nil {
+		cache = db
+	}
+	builder := &graph.Builder{S2: s2, Cache: cache}
 	deps := api.Deps{S2: s2, DB: db, Builder: builder}
 
 	srv := &http.Server{

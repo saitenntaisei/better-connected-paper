@@ -16,16 +16,20 @@ import (
 // --- Stubs ---
 
 type stubS2 struct {
-	searchResp *citation.SearchResponse
-	searchErr  error
-	paper      *citation.Paper
-	paperErr   error
+	searchResp  *citation.SearchResponse
+	searchErr   error
+	searchCalls int
+	paper       *citation.Paper
+	paperErr    error
+	paperCalls  int
 }
 
 func (s *stubS2) Search(_ context.Context, _ string, _ int, _ []string) (*citation.SearchResponse, error) {
+	s.searchCalls++
 	return s.searchResp, s.searchErr
 }
 func (s *stubS2) GetPaper(_ context.Context, _ string, _ []string) (*citation.Paper, error) {
+	s.paperCalls++
 	return s.paper, s.paperErr
 }
 
@@ -87,6 +91,26 @@ func TestSearchHappyPath(t *testing.T) {
 	}
 	if got.Total != 1 || len(got.Results) != 1 || got.Results[0].ID != "abc" {
 		t.Fatalf("unexpected: %+v", got)
+	}
+}
+
+// Second identical search hits the in-memory cache instead of S2.
+func TestSearchCacheHit(t *testing.T) {
+	s2 := &stubS2{searchResp: &citation.SearchResponse{
+		Total: 1,
+		Data:  []citation.Paper{{PaperID: "abc", Title: "t"}},
+	}}
+	r := NewRouter(Deps{S2: s2})
+
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=abc&limit=5", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("iter %d: code=%d body=%s", i, rec.Code, rec.Body)
+		}
+	}
+	if s2.searchCalls != 1 {
+		t.Errorf("S2.Search called %d times, want 1 (TTL cache should absorb repeats)", s2.searchCalls)
 	}
 }
 

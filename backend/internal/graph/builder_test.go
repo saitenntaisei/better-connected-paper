@@ -276,6 +276,88 @@ func TestBuildSetsBuiltAt(t *testing.T) {
 	}
 }
 
+// stubCache captures what the Builder reads/writes so the cache-aware
+// paths can be asserted without a real Postgres.
+type stubCache struct {
+	have     map[string]citation.Paper
+	upserted []citation.Paper
+	links    map[string][2][]string // paperID -> [refs, cites]
+}
+
+func (c *stubCache) GetPapersWithLinks(_ context.Context, ids []string) ([]citation.Paper, error) {
+	out := make([]citation.Paper, 0, len(ids))
+	for _, id := range ids {
+		if p, ok := c.have[id]; ok {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+func (c *stubCache) UpsertPapers(_ context.Context, papers []citation.Paper) error {
+	c.upserted = append(c.upserted, papers...)
+	return nil
+}
+
+func (c *stubCache) ReplacePaperLinks(_ context.Context, paperID string, refs, cites []string) error {
+	if c.links == nil {
+		c.links = map[string][2][]string{}
+	}
+	c.links[paperID] = [2][]string{slices.Clone(refs), slices.Clone(cites)}
+	return nil
+}
+
+// Cache hit on the seed must short-circuit the S2 GetPaper call.
+func TestBuildHitsCacheForSeed(t *testing.T) {
+	s2 := &stubS2{papers: map[string]citation.Paper{
+		// Intentionally no "S": S2 must NEVER be consulted for the seed.
+		"R1": paper("R1", nil, nil),
+		"R2": paper("R2", nil, nil),
+	}}
+	cache := &stubCache{have: map[string]citation.Paper{
+		"S": paper("S", []string{"R1", "R2"}, nil),
+	}}
+	b := &Builder{S2: s2, Cache: cache, MaxNodes: 10}
+
+	resp, err := b.Build(context.Background(), "S")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if resp.Seed.ID != "S" {
+		t.Errorf("seed ID = %q, want S", resp.Seed.ID)
+	}
+}
+
+// After a successful build, selected full-metadata nodes must be pushed
+// into the cache (papers table + paper_links) so /api/paper/{id} can
+// answer from Postgres without hitting S2.
+func TestBuildPersistsFullNodes(t *testing.T) {
+	s2 := &stubS2{papers: map[string]citation.Paper{
+		"S":  paper("S", []string{"R1", "R2"}, nil),
+		"R1": paper("R1", nil, nil),
+		"R2": paper("R2", nil, nil),
+	}}
+	cache := &stubCache{}
+	b := &Builder{S2: s2, Cache: cache, MaxNodes: 10}
+
+	if _, err := b.Build(context.Background(), "S"); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	gotIDs := map[string]bool{}
+	for _, p := range cache.upserted {
+		gotIDs[p.PaperID] = true
+	}
+	for _, want := range []string{"S", "R1", "R2"} {
+		if !gotIDs[want] {
+			t.Errorf("paper %s missing from upsert; got %+v", want, gotIDs)
+		}
+	}
+	if _, ok := cache.links["S"]; !ok {
+		t.Error("seed links were not replaced in cache")
+	}
+}
+
 // Guard against Edge dedupe collapsing a cite+similarity pair that happens to
 // share endpoints but not kind.
 func TestDedupeEdgesKeepsDifferentKinds(t *testing.T) {

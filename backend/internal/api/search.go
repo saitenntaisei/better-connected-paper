@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,20 +52,46 @@ func (d Deps) Search(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
-	resp, err := d.S2.Search(r.Context(), q, limit, searchFields)
+	key := searchCacheKey(q, limit)
+	if cached, ok := d.SearchCache.get(key); ok {
+		w.Header().Set("X-Cache", "hit")
+		WriteJSON(w, http.StatusOK, cached)
+		return
+	}
+
+	out, err := d.doSearch(r.Context(), key, q, limit)
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, "semantic scholar: "+err.Error())
 		return
 	}
-
-	out := searchResponse{
-		Total:   resp.Total,
-		Results: make([]searchResult, 0, len(resp.Data)),
-	}
-	for _, p := range resp.Data {
-		out.Results = append(out.Results, toSearchResult(p))
-	}
 	WriteJSON(w, http.StatusOK, out)
+}
+
+// doSearch coalesces concurrent identical searches and memoizes the result.
+func (d Deps) doSearch(ctx context.Context, key, q string, limit int) (searchResponse, error) {
+	fetch := func() (searchResponse, error) {
+		resp, err := d.S2.Search(ctx, q, limit, searchFields)
+		if err != nil {
+			return searchResponse{}, err
+		}
+		out := searchResponse{
+			Total:   resp.Total,
+			Results: make([]searchResult, 0, len(resp.Data)),
+		}
+		for _, p := range resp.Data {
+			out.Results = append(out.Results, toSearchResult(p))
+		}
+		d.SearchCache.put(key, out)
+		return out, nil
+	}
+	if d.SFlight == nil {
+		return fetch()
+	}
+	v, err, _ := d.SFlight.Do("search:"+key, func() (any, error) { return fetch() })
+	if err != nil {
+		return searchResponse{}, err
+	}
+	return v.(searchResponse), nil
 }
 
 func toSearchResult(p citation.Paper) searchResult {
