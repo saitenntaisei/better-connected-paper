@@ -24,6 +24,16 @@ type Builder struct {
 	BatchSize int           // S2 batch cap: 500, we use 100 to keep responses small
 	Timeout   time.Duration // default 90s
 	Now       func() time.Time
+
+	// TwoHopSupport is the minimum number of first-hop papers a second-hop
+	// candidate must connect to before we consider it. 2 means "shared by at
+	// least two first-hop neighbors", which is the standard bibliographic-
+	// coupling signal for bridge papers. Default 2.
+	TwoHopSupport int
+
+	// SimilarityEdgeThreshold is the minimum pairwise similarity weight
+	// required to emit a similarity edge in the returned graph. Default 0.15.
+	SimilarityEdgeThreshold float64
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -36,8 +46,18 @@ var seedFields = []string{
 	"citations.paperId",
 }
 
-// candidateFields fetches minimal metadata + nested ids for each candidate.
-var candidateFields = []string{
+// minimalLinkFields is the cheap fetch used to explore the 1-hop cloud:
+// paper id plus the id lists we need for scoring. No title/abstract/etc.,
+// so the response size stays linear in |refs|+|cites| rather than quadratic.
+var minimalLinkFields = []string{
+	"paperId",
+	"references.paperId",
+	"citations.paperId",
+}
+
+// fullNodeFields hydrates a selected node for the final response (title,
+// authors, abstract, etc.). We only pay this for at most MaxNodes papers.
+var fullNodeFields = []string{
 	"paperId", "title", "abstract", "year", "venue", "authors",
 	"citationCount", "referenceCount", "externalIds", "url",
 	"references.paperId",
@@ -45,13 +65,19 @@ var candidateFields = []string{
 }
 
 // Build expands the graph around seedID and returns the response ready for the frontend.
+//
+// The expansion is staged so a high-degree seed can't blow the request budget:
+//  1. fetch seed (full metadata + ref/cite id lists)
+//  2. batch-fetch first-hop neighbors with *minimal* fields only — just
+//     enough to compute similarity and enumerate second-hop edges
+//  3. collect second-hop candidates that are cited/referenced by at least
+//     TwoHopSupport first-hop papers (bibliographic-coupling bridges)
+//  4. rank all candidates and select top MaxNodes-1
+//  5. batch-fetch full metadata for the selected subset only
+//  6. emit directed cite edges for selected pairs and similarity edges for
+//     pairs whose pairwise (biblio + co-cite)/2 exceeds the threshold.
 func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
-	if b.MaxNodes <= 0 {
-		b.MaxNodes = 40
-	}
-	if b.BatchSize <= 0 {
-		b.BatchSize = 100
-	}
+	b.applyDefaults()
 	if b.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, b.Timeout)
@@ -73,76 +99,77 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	seedRefs := seed.RefIDs()
 	seedCitedBy := seed.CitedByIDs()
 
-	candidateIDs := dedupeExcluding(append(append([]string(nil), seedRefs...), seedCitedBy...), seed.PaperID)
-	candidates := []citation.Paper{}
-	if len(candidateIDs) > 0 {
-		for _, chunk := range chunkStrings(candidateIDs, b.BatchSize) {
-			batch, err := b.S2.GetPaperBatch(ctx, chunk, candidateFields)
-			if err != nil {
-				return nil, fmt.Errorf("fetch candidates: %w", err)
-			}
-			candidates = append(candidates, batch...)
-		}
+	firstHopIDs := dedupeExcluding(append(append([]string(nil), seedRefs...), seedCitedBy...), seed.PaperID)
+	firstHop, err := b.batchFetch(ctx, firstHopIDs, minimalLinkFields)
+	if err != nil {
+		return nil, fmt.Errorf("fetch first hop: %w", err)
+	}
+	firstHopByID := indexPapers(firstHop)
+
+	twoHopSupport := countTwoHopSupport(firstHop, seed.PaperID, firstHopByID)
+	scored := rankCandidates(seed, firstHop, twoHopSupport, b.TwoHopSupport)
+
+	// Trim to MaxNodes-1 candidates *before* paying for full metadata.
+	if len(scored) > b.MaxNodes-1 {
+		scored = scored[:b.MaxNodes-1]
 	}
 
-	type scored struct {
-		p     citation.Paper
-		score float64
-	}
-	scoredCandidates := make([]scored, 0, len(candidates))
-	for _, c := range candidates {
-		if c.PaperID == "" || c.PaperID == seed.PaperID {
-			continue
-		}
-		biblio := BibliographicCoupling(seedRefs, c.RefIDs())
-		coCite := CoCitation(seedCitedBy, c.CitedByIDs())
-		direct := DirectLink(seedRefs, seedCitedBy, c.PaperID)
-		scoredCandidates = append(scoredCandidates, scored{c, Score(biblio, coCite, direct)})
+	selectedIDs := make([]string, 0, len(scored)+1)
+	selectedIDs = append(selectedIDs, seed.PaperID)
+	for _, s := range scored {
+		selectedIDs = append(selectedIDs, s.id)
 	}
 
-	sort.SliceStable(scoredCandidates, func(i, j int) bool {
-		if scoredCandidates[i].score == scoredCandidates[j].score {
-			return scoredCandidates[i].p.CitationCount > scoredCandidates[j].p.CitationCount
-		}
-		return scoredCandidates[i].score > scoredCandidates[j].score
-	})
-
-	limit := min(b.MaxNodes-1, len(scoredCandidates))
-	selected := scoredCandidates[:max(0, limit)]
-
-	selectedIDs := make(map[string]struct{}, len(selected)+1)
-	selectedIDs[seed.PaperID] = struct{}{}
-	for _, s := range selected {
-		selectedIDs[s.p.PaperID] = struct{}{}
+	// Full metadata fetch is bounded to the selected subset.
+	full, err := b.batchFetch(ctx, stripSeed(selectedIDs, seed.PaperID), fullNodeFields)
+	if err != nil {
+		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
+	fullByID := indexPapers(full)
 
+	nodes := make([]Node, 0, len(scored)+1)
 	seedNode := ToNode(*seed)
 	seedNode.IsSeed = true
 	seedNode.Similarity = 0
-
-	nodes := make([]Node, 0, len(selected)+1)
 	nodes = append(nodes, seedNode)
-	for _, s := range selected {
-		n := ToNode(s.p)
+
+	scoreByID := make(map[string]float64, len(scored))
+	for _, s := range scored {
+		scoreByID[s.id] = s.score
+		p, ok := fullByID[s.id]
+		if !ok {
+			// Fall back to the minimal record so the node still appears.
+			if mp, okm := firstHopByID[s.id]; okm {
+				p = mp
+			} else {
+				p = citation.Paper{PaperID: s.id}
+			}
+		}
+		n := ToNode(p)
 		n.Similarity = s.score
 		nodes = append(nodes, n)
 	}
 
-	// Directed citation edges: for every paper P in the selected set (seed + candidates),
-	// for each paperId R in P.References, if R is also selected, add edge P -> R.
-	edges := []Edge{}
-	addEdges := func(src citation.Paper) {
-		for _, tid := range src.RefIDs() {
-			if _, ok := selectedIDs[tid]; !ok {
-				continue
-			}
-			edges = append(edges, Edge{Source: src.PaperID, Target: tid, Kind: EdgeCite, Weight: 1})
+	// Union the hydrated + minimal records so edge construction has ref/cite
+	// lists for every selected id (second-hop ids only have minimal data).
+	linkSource := make(map[string]citation.Paper, len(selectedIDs))
+	for id := range sliceSet(selectedIDs) {
+		if p, ok := fullByID[id]; ok {
+			linkSource[id] = p
+			continue
+		}
+		if p, ok := firstHopByID[id]; ok {
+			linkSource[id] = p
+			continue
+		}
+		if id == seed.PaperID {
+			linkSource[id] = *seed
 		}
 	}
-	addEdges(*seed)
-	for _, s := range selected {
-		addEdges(s.p)
-	}
+
+	selectedSet := sliceSet(selectedIDs)
+	edges := buildCiteEdges(selectedIDs, selectedSet, linkSource)
+	edges = append(edges, buildSimilarityEdges(selectedIDs, linkSource, b.SimilarityEdgeThreshold)...)
 	edges = dedupeEdges(edges)
 
 	return &Response{
@@ -151,6 +178,232 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		Edges:   edges,
 		BuiltAt: now().UTC(),
 	}, nil
+}
+
+func (b *Builder) applyDefaults() {
+	if b.MaxNodes <= 0 {
+		b.MaxNodes = 40
+	}
+	if b.BatchSize <= 0 {
+		b.BatchSize = 100
+	}
+	if b.TwoHopSupport <= 0 {
+		b.TwoHopSupport = 2
+	}
+	if b.SimilarityEdgeThreshold <= 0 {
+		b.SimilarityEdgeThreshold = 0.15
+	}
+}
+
+func (b *Builder) batchFetch(ctx context.Context, ids []string, fields []string) ([]citation.Paper, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	out := make([]citation.Paper, 0, len(ids))
+	for _, chunk := range chunkStrings(ids, b.BatchSize) {
+		batch, err := b.S2.GetPaperBatch(ctx, chunk, fields)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+	}
+	return out, nil
+}
+
+// scoredCandidate keeps just the id and score so the "ranked" slice is cheap
+// to sort and trim before we decide what to fully hydrate.
+type scoredCandidate struct {
+	id    string
+	score float64
+	// cc is the candidate's citation count when known, used as a deterministic
+	// tiebreaker so equal scores preserve the "more-cited paper first" order.
+	cc int
+}
+
+// rankCandidates assigns a score to every first-hop paper (biblio coupling +
+// co-citation + direct link to seed) and to every second-hop bridge (fraction
+// of first-hop papers that link to it, weighted). 2-hop candidates can't be
+// biblio-coupled against seed because we haven't fetched their refs; using
+// their connectivity to the first-hop cloud is the structural proxy.
+func rankCandidates(
+	seed *citation.Paper,
+	firstHop []citation.Paper,
+	twoHopSupport map[string]int,
+	minSupport int,
+) []scoredCandidate {
+	seedRefs := seed.RefIDs()
+	seedCitedBy := seed.CitedByIDs()
+
+	scores := make(map[string]scoredCandidate, len(firstHop)+len(twoHopSupport))
+
+	for _, p := range firstHop {
+		if p.PaperID == "" || p.PaperID == seed.PaperID {
+			continue
+		}
+		biblio := BibliographicCoupling(seedRefs, p.RefIDs())
+		coCite := CoCitation(seedCitedBy, p.CitedByIDs())
+		direct := DirectLink(seedRefs, seedCitedBy, p.PaperID)
+		scores[p.PaperID] = scoredCandidate{
+			id:    p.PaperID,
+			score: Score(biblio, coCite, direct),
+			cc:    p.CitationCount,
+		}
+	}
+
+	if len(firstHop) > 0 {
+		for id, support := range twoHopSupport {
+			if support < minSupport {
+				continue
+			}
+			if _, already := scores[id]; already {
+				continue
+			}
+			if id == seed.PaperID {
+				continue
+			}
+			// Normalize to [0,1]: fully-supported = 1.0 (every first-hop
+			// paper bridges to this candidate). Multiplied by 0.5 so a
+			// 2-hop bridge with maximal support (1.0) scores 0.5 — below
+			// a well-coupled first-hop paper but above an unrelated one.
+			ratio := float64(support) / float64(len(firstHop))
+			scores[id] = scoredCandidate{id: id, score: 0.5 * ratio}
+		}
+	}
+
+	out := make([]scoredCandidate, 0, len(scores))
+	for _, s := range scores {
+		out = append(out, s)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].score == out[j].score {
+			return out[i].cc > out[j].cc
+		}
+		return out[i].score > out[j].score
+	})
+	return out
+}
+
+// countTwoHopSupport counts, for every paper id reached by either a reference
+// or a citation of some first-hop paper, how many distinct first-hop papers
+// link to it. Own-first-hop members are excluded — we only want bridges.
+func countTwoHopSupport(firstHop []citation.Paper, seedID string, firstHopByID map[string]citation.Paper) map[string]int {
+	support := make(map[string]int)
+	for _, p := range firstHop {
+		seenFromP := make(map[string]struct{})
+		for _, rid := range p.RefIDs() {
+			if rid == "" || rid == seedID {
+				continue
+			}
+			if _, inFirstHop := firstHopByID[rid]; inFirstHop {
+				continue
+			}
+			if _, ok := seenFromP[rid]; ok {
+				continue
+			}
+			seenFromP[rid] = struct{}{}
+			support[rid]++
+		}
+		for _, cid := range p.CitedByIDs() {
+			if cid == "" || cid == seedID {
+				continue
+			}
+			if _, inFirstHop := firstHopByID[cid]; inFirstHop {
+				continue
+			}
+			if _, ok := seenFromP[cid]; ok {
+				continue
+			}
+			seenFromP[cid] = struct{}{}
+			support[cid]++
+		}
+	}
+	return support
+}
+
+// buildCiteEdges walks every selected paper and emits a directed A->B edge
+// whenever A references B and both endpoints are in the selected set.
+func buildCiteEdges(selectedIDs []string, selectedSet map[string]struct{}, links map[string]citation.Paper) []Edge {
+	edges := make([]Edge, 0)
+	for _, id := range selectedIDs {
+		p, ok := links[id]
+		if !ok {
+			continue
+		}
+		for _, tid := range p.RefIDs() {
+			if _, selected := selectedSet[tid]; !selected {
+				continue
+			}
+			edges = append(edges, Edge{Source: id, Target: tid, Kind: EdgeCite, Weight: 1})
+		}
+	}
+	return edges
+}
+
+// buildSimilarityEdges emits pairwise similarity edges for every unordered
+// pair of selected nodes whose structural similarity (mean of bibliographic
+// coupling and co-citation, each Salton-normalized) exceeds threshold.
+// The edge is undirected in semantics; we canonicalize (lo, hi) so dedupe
+// collapses the two orderings.
+func buildSimilarityEdges(selectedIDs []string, links map[string]citation.Paper, threshold float64) []Edge {
+	edges := make([]Edge, 0)
+	for i := range selectedIDs {
+		a, okA := links[selectedIDs[i]]
+		if !okA {
+			continue
+		}
+		aRefs := a.RefIDs()
+		aCites := a.CitedByIDs()
+		if len(aRefs) == 0 && len(aCites) == 0 {
+			continue
+		}
+		for j := i + 1; j < len(selectedIDs); j++ {
+			b, okB := links[selectedIDs[j]]
+			if !okB {
+				continue
+			}
+			biblio := BibliographicCoupling(aRefs, b.RefIDs())
+			coCite := CoCitation(aCites, b.CitedByIDs())
+			weight := (biblio + coCite) / 2
+			if weight < threshold {
+				continue
+			}
+			lo, hi := selectedIDs[i], selectedIDs[j]
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			edges = append(edges, Edge{Source: lo, Target: hi, Kind: EdgeSimilarity, Weight: weight})
+		}
+	}
+	return edges
+}
+
+func indexPapers(ps []citation.Paper) map[string]citation.Paper {
+	out := make(map[string]citation.Paper, len(ps))
+	for _, p := range ps {
+		if p.PaperID != "" {
+			out[p.PaperID] = p
+		}
+	}
+	return out
+}
+
+func sliceSet(ids []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+func stripSeed(ids []string, seedID string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == seedID {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 func dedupeExcluding(ids []string, exclude string) []string {
@@ -181,10 +434,10 @@ func chunkStrings(in []string, size int) [][]string {
 }
 
 func dedupeEdges(edges []Edge) []Edge {
-	seen := make(map[[2]string]struct{}, len(edges))
+	seen := make(map[[3]string]struct{}, len(edges))
 	out := edges[:0]
 	for _, e := range edges {
-		key := [2]string{e.Source, e.Target}
+		key := [3]string{string(e.Kind), e.Source, e.Target}
 		if _, ok := seen[key]; ok {
 			continue
 		}
