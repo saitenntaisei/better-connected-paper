@@ -176,3 +176,140 @@ body {
   border: 1px solid var(--border);
   border-radius: 0.5rem;
 }
+
+.graph-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 1rem;
+}
+
+.graph-side {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+@media (max-width: 800px) {
+  .graph-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.detail,
+.legend {
+  padding: 1rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.detail.placeholder {
+  opacity: 0.75;
+}
+
+.detail-title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+
+.detail-authors {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+
+.detail-abstract {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.detail-links {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.detail-links a {
+  color: var(--accent);
+  text-decoration: none;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.legend-title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  margin-bottom: 0.25rem;
+}
+
+.swatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: 999px;
+  background: hsl(220, 70%, 55%);
+  color: #111;
+  font-weight: bold;
+}
+
+.swatch.seed {
+  background: transparent;
+  border: 3px solid #f59e0b;
+}
+
+.swatch.cite {
+  background: #6b7280;
+  color: white;
+  border-radius: 0.25rem;
+}
+
+.swatch.similarity {
+  background: transparent;
+  border-bottom: 2px dashed #9ca3af;
+  border-radius: 0;
+  height: 0.75rem;
+}
+
+.legend-gradient {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.legend-gradient .gradient {
+  flex: 1;
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, hsl(220, 70%, 55%), hsl(12, 70%, 55%));
+}
+
+.legend-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+}

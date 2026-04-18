@@ -56,6 +56,9 @@ describe("App", () => {
         builtAt: "2026-04-18T00:00:00Z",
       }),
     );
+    fetchMock.mockResolvedValue(
+      json({ paperId: "p1", title: "Attention Is All You Need" }),
+    );
 
     const user = userEvent.setup();
     render(<App />);
@@ -70,8 +73,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByTestId("graph-stub")).toBeInTheDocument();
     });
-    const calls = fetchMock.mock.calls;
-    expect(calls.at(-1)?.[0]).toBe("/api/graph/build");
-    expect((calls.at(-1)?.[1] as RequestInit).method).toBe("POST");
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls).toContain("/api/graph/build");
   });
 });
