@@ -2,6 +2,8 @@ package citation
 
 // Paper is the canonical shape returned by Semantic Scholar.
 // JSON tags match S2 Graph API v1 responses.
+// References/Citations are only populated when the caller asks for them
+// (e.g. fields=references.paperId or citations.paperId).
 type Paper struct {
 	PaperID         string            `json:"paperId"`
 	Title           string            `json:"title"`
@@ -14,6 +16,24 @@ type Paper struct {
 	InfluentialCite int               `json:"influentialCitationCount,omitempty"`
 	ExternalIDs     map[string]string `json:"externalIds,omitempty"`
 	URL             string            `json:"url,omitempty"`
+	References      []Paper           `json:"references,omitempty"`
+	Citations       []Paper           `json:"citations,omitempty"`
+}
+
+// RefIDs returns the paperIds of papers this paper cites.
+func (p *Paper) RefIDs() []string { return idsOf(p.References) }
+
+// CitedByIDs returns the paperIds of papers citing this paper.
+func (p *Paper) CitedByIDs() []string { return idsOf(p.Citations) }
+
+func idsOf(ps []Paper) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		if p.PaperID != "" {
+			out = append(out, p.PaperID)
+		}
+	}
+	return out
 }
 
 // Author identifies a contributor on a paper.
