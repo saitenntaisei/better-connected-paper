@@ -64,18 +64,10 @@ var fullNodeFields = []string{
 	"citations.paperId",
 }
 
-// Build expands the graph around seedID and returns the response ready for the frontend.
-//
-// The expansion is staged so a high-degree seed can't blow the request budget:
-//  1. fetch seed (full metadata + ref/cite id lists)
-//  2. batch-fetch first-hop neighbors with *minimal* fields only — just
-//     enough to compute similarity and enumerate second-hop edges
-//  3. collect second-hop candidates that are cited/referenced by at least
-//     TwoHopSupport first-hop papers (bibliographic-coupling bridges)
-//  4. rank all candidates and select top MaxNodes-1
-//  5. batch-fetch full metadata for the selected subset only
-//  6. emit directed cite edges for selected pairs and similarity edges for
-//     pairs whose pairwise (biblio + co-cite)/2 exceeds the threshold.
+// Build expands the graph around seedID. The expansion is staged (cheap
+// minimal-fields fetch for the first hop, full-metadata fetch only for the
+// pruned top-MaxNodes subset) so a high-degree seed can't blow the request
+// budget.
 func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	b.applyDefaults()
 	if b.Timeout > 0 {
@@ -108,8 +100,6 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 
 	twoHopSupport := countTwoHopSupport(firstHop, seed.PaperID, firstHopByID)
 	scored := rankCandidates(seed, firstHop, twoHopSupport, b.TwoHopSupport)
-
-	// Trim to MaxNodes-1 candidates *before* paying for full metadata.
 	if len(scored) > b.MaxNodes-1 {
 		scored = scored[:b.MaxNodes-1]
 	}
@@ -120,8 +110,7 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		selectedIDs = append(selectedIDs, s.id)
 	}
 
-	// Full metadata fetch is bounded to the selected subset.
-	full, err := b.batchFetch(ctx, stripSeed(selectedIDs, seed.PaperID), fullNodeFields)
+	full, err := b.batchFetch(ctx, selectedIDs[1:], fullNodeFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
@@ -133,12 +122,11 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	seedNode.Similarity = 0
 	nodes = append(nodes, seedNode)
 
-	scoreByID := make(map[string]float64, len(scored))
 	for _, s := range scored {
-		scoreByID[s.id] = s.score
 		p, ok := fullByID[s.id]
 		if !ok {
-			// Fall back to the minimal record so the node still appears.
+			// Second-hop bridges only have minimal fields; fall back so the
+			// node still appears even without full metadata.
 			if mp, okm := firstHopByID[s.id]; okm {
 				p = mp
 			} else {
@@ -150,20 +138,15 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		nodes = append(nodes, n)
 	}
 
-	// Union the hydrated + minimal records so edge construction has ref/cite
-	// lists for every selected id (second-hop ids only have minimal data).
+	// Edge construction needs ref/cite lists for every selected id; the full
+	// fetch drops them for 2-hop bridges, so union with the minimal records.
 	linkSource := make(map[string]citation.Paper, len(selectedIDs))
-	for id := range sliceSet(selectedIDs) {
+	linkSource[seed.PaperID] = *seed
+	for _, id := range selectedIDs {
 		if p, ok := fullByID[id]; ok {
 			linkSource[id] = p
-			continue
-		}
-		if p, ok := firstHopByID[id]; ok {
+		} else if p, ok := firstHopByID[id]; ok {
 			linkSource[id] = p
-			continue
-		}
-		if id == seed.PaperID {
-			linkSource[id] = *seed
 		}
 	}
 
@@ -290,38 +273,29 @@ func countTwoHopSupport(firstHop []citation.Paper, seedID string, firstHopByID m
 	support := make(map[string]int)
 	for _, p := range firstHop {
 		seenFromP := make(map[string]struct{})
+		tally := func(id string) {
+			if id == "" || id == seedID {
+				return
+			}
+			if _, inFirstHop := firstHopByID[id]; inFirstHop {
+				return
+			}
+			if _, ok := seenFromP[id]; ok {
+				return
+			}
+			seenFromP[id] = struct{}{}
+			support[id]++
+		}
 		for _, rid := range p.RefIDs() {
-			if rid == "" || rid == seedID {
-				continue
-			}
-			if _, inFirstHop := firstHopByID[rid]; inFirstHop {
-				continue
-			}
-			if _, ok := seenFromP[rid]; ok {
-				continue
-			}
-			seenFromP[rid] = struct{}{}
-			support[rid]++
+			tally(rid)
 		}
 		for _, cid := range p.CitedByIDs() {
-			if cid == "" || cid == seedID {
-				continue
-			}
-			if _, inFirstHop := firstHopByID[cid]; inFirstHop {
-				continue
-			}
-			if _, ok := seenFromP[cid]; ok {
-				continue
-			}
-			seenFromP[cid] = struct{}{}
-			support[cid]++
+			tally(cid)
 		}
 	}
 	return support
 }
 
-// buildCiteEdges walks every selected paper and emits a directed A->B edge
-// whenever A references B and both endpoints are in the selected set.
 func buildCiteEdges(selectedIDs []string, selectedSet map[string]struct{}, links map[string]citation.Paper) []Edge {
 	edges := make([]Edge, 0)
 	for _, id := range selectedIDs {
@@ -391,17 +365,6 @@ func sliceSet(ids []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		out[id] = struct{}{}
-	}
-	return out
-}
-
-func stripSeed(ids []string, seedID string) []string {
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id == seedID {
-			continue
-		}
-		out = append(out, id)
 	}
 	return out
 }

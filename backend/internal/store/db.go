@@ -51,6 +51,11 @@ func (db *DB) Close() {
 	}
 }
 
+// Ping verifies the pool can still reach Postgres.
+func (db *DB) Ping(ctx context.Context) error {
+	return db.Pool.Ping(ctx)
+}
+
 // Migrate applies migrations in lexical order using a simple schema_migrations table.
 // We use an embedded FS rather than golang-migrate to keep deps minimal.
 func (db *DB) Migrate(ctx context.Context) error {

@@ -33,10 +33,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 func initHandler() {
 	ctx := context.Background()
 
-	// DB is optional — S2-backed reads still work without the cache. But any
-	// failure here (bad DSN, unreachable host, migration error) gets logged
-	// loudly so ops can spot it in `vercel logs` instead of silently serving
-	// every request uncached. /api/health also reports the degraded state.
+	// DB is optional; failures are logged so ops see them in `vercel logs`
+	// and /api/health surfaces the degraded state.
 	var db *store.DB
 	if dsn := os.Getenv("DATABASE_URL"); dsn == "" {
 		log.Printf("init: DATABASE_URL unset — running without persistence cache")

@@ -15,27 +15,22 @@ export default function App() {
   const { state: graphState, build } = useGraph();
   const { seed: urlSeed, setSeed: setUrlSeed } = useUrlSeed();
 
-  const [seedId, setSeedId] = useState<string | null>(urlSeed);
   const [focusId, setFocusId] = useState<string | null>(urlSeed);
   const [showSimilarity, setShowSimilarity] = useState(false);
 
-  // Keep local seed in lock-step with the URL so back/forward navigation
-  // (popstate) actually rebuilds the graph. Without this, urlSeed changes
-  // inside the hook but App keeps showing the old seedId snapshot.
+  // Reset the detail-panel focus whenever the seed changes — including the
+  // popstate case, which updates urlSeed without going through selectSeed.
   useEffect(() => {
-    setSeedId((current) => (current === urlSeed ? current : urlSeed));
-    setFocusId((current) => (current === urlSeed ? current : urlSeed));
+    setFocusId(urlSeed);
   }, [urlSeed]);
 
   useEffect(() => {
-    if (!seedId) return;
-    void build(seedId);
-  }, [seedId, build]);
+    if (!urlSeed) return;
+    void build(urlSeed);
+  }, [urlSeed, build]);
 
   const selectSeed = useCallback(
     (result: SearchResult) => {
-      setSeedId(result.id);
-      setFocusId(result.id);
       setUrlSeed(result.id);
     },
     [setUrlSeed],
@@ -48,9 +43,9 @@ export default function App() {
   );
   const seedTitle = useMemo(() => {
     if (graphState.status === "success") return graphState.data.seed.title;
-    const hit = results.find((r) => r.id === seedId);
-    return hit?.title ?? seedId;
-  }, [graphState, results, seedId]);
+    const hit = results.find((r) => r.id === urlSeed);
+    return hit?.title ?? urlSeed;
+  }, [graphState, results, urlSeed]);
   const yearRange = useMemo<[number, number] | undefined>(() => {
     if (graphState.status !== "success") return undefined;
     const years = graphState.data.nodes.map((n) => n.year ?? 0).filter((y) => y > 0);
@@ -86,13 +81,13 @@ export default function App() {
           </h2>
           <ResultsList
             results={results}
-            selectedId={seedId ?? undefined}
+            selectedId={urlSeed ?? undefined}
             onSelect={selectSeed}
           />
         </section>
       )}
 
-      {seedId ? (
+      {urlSeed ? (
         <section className="graph-section" aria-labelledby="graph-heading">
           <div className="graph-header">
             <h2 id="graph-heading" className="section-heading">
@@ -116,7 +111,7 @@ export default function App() {
                   <p>{graphState.error}</p>
                   <button
                     type="button"
-                    onClick={() => void build(seedId, true)}
+                    onClick={() => void build(urlSeed, true)}
                     className="retry"
                   >
                     Retry

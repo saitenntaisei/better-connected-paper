@@ -54,10 +54,6 @@ func paper(id string, refs, cites []string) citation.Paper {
 	return p
 }
 
-func edgeKey(e Edge) [3]string {
-	return [3]string{string(e.Kind), e.Source, e.Target}
-}
-
 // Scenario:
 //
 //	seed S references R1, R2; is cited by C1, C2.
@@ -300,6 +296,3 @@ func TestDedupeEdgesKeepsDifferentKinds(t *testing.T) {
 		t.Errorf("expected both EdgeCite and EdgeSimilarity preserved; got %+v", seen)
 	}
 }
-
-// Avoid edgeKey lint noise in environments without it: force reference.
-var _ = edgeKey(Edge{})

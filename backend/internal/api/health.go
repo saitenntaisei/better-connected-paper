@@ -37,12 +37,12 @@ func (d Deps) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d Deps) checkPersistence(ctx context.Context) persistenceStatus {
-	if d.DB == nil || d.DB.Pool == nil {
+	if d.DB == nil {
 		return persistenceStatus{Enabled: false, Healthy: false}
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if err := d.DB.Pool.Ping(pingCtx); err != nil {
+	if err := d.DB.Ping(pingCtx); err != nil {
 		return persistenceStatus{Enabled: true, Healthy: false, Error: err.Error()}
 	}
 	return persistenceStatus{Enabled: true, Healthy: true}
