@@ -4,13 +4,21 @@
   line-height: 1.5;
   --fg: #111827;
   --bg: #f9fafb;
+  --card: #ffffff;
+  --border: #e5e7eb;
   --accent: #2563eb;
+  --muted: #6b7280;
+  --error: #b91c1c;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --fg: #f3f4f6;
     --bg: #0b1220;
+    --card: #0f172a;
+    --border: #1f2937;
+    --muted: #9ca3af;
+    --error: #f87171;
   }
 }
 
@@ -27,7 +35,7 @@ body {
 .app-shell {
   max-width: 960px;
   margin: 0 auto;
-  padding: 2rem 1rem;
+  padding: 2rem 1rem 4rem;
 }
 
 .app-shell h1 {
@@ -37,11 +45,122 @@ body {
 
 .tagline {
   margin: 0 0 1.5rem;
-  opacity: 0.8;
+  color: var(--muted);
 }
 
-.status {
-  padding: 0.75rem 1rem;
+.muted {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.search-bar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.search-bar input {
+  flex: 1;
+  padding: 0.6rem 0.75rem;
+  font-size: 1rem;
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  background: var(--card);
+  color: inherit;
+}
+
+.search-bar button {
+  padding: 0.6rem 1.1rem;
+  font-size: 1rem;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.search-bar button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.section-heading {
+  font-size: 1.1rem;
+  margin: 1rem 0 0.5rem;
+}
+
+.results-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.result {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.75rem 1rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.result:hover {
+  border-color: var(--accent);
+}
+
+.result.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.result-title {
+  font-weight: 600;
+}
+
+.result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.result-authors {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.results-empty {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--error);
+  margin: 0.5rem 0;
+}
+
+.selection {
+  margin-top: 2rem;
+  padding: 1rem 1.25rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.selection-title {
+  font-weight: 600;
+  margin: 0 0 0.5rem;
+}
+
+.selection-abstract {
+  margin: 0 0 0.75rem;
 }
