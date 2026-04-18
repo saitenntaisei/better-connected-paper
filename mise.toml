@@ -40,6 +40,11 @@ depends = ["test:backend", "test:frontend"]
 dir = "backend"
 run = "go test ./..."
 
+[tasks."test:integration"]
+description = "Run DB-backed integration tests (requires postgres running)"
+dir = "backend"
+run = "go test -tags=integration ./..."
+
 [tasks."test:frontend"]
 dir = "frontend"
 run = "npm test -- --run"

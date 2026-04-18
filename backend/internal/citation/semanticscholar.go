@@ -159,10 +159,7 @@ func (c *Client) listPapers(ctx context.Context, path string, limit int, fields 
 	if limit <= 0 {
 		limit = 100
 	}
-	perPage := 100
-	if limit < perPage {
-		perPage = limit
-	}
+	perPage := min(limit, 100)
 
 	nestedFields := make([]string, len(fields))
 	for i, f := range fields {
@@ -289,11 +286,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 
 func backoff(attempt int) time.Duration {
 	base := 500 * time.Millisecond
-	d := base * (1 << attempt)
-	if d > 8*time.Second {
-		d = 8 * time.Second
-	}
-	return d
+	return min(base*(1<<attempt), 8*time.Second)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
