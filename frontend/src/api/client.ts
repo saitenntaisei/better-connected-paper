@@ -5,7 +5,8 @@ import type {
   SearchResponse,
 } from "../types/api";
 
-const DEFAULT_BASE = "/api";
+const DEFAULT_BASE =
+  (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, "") || "/api";
 
 export class ApiError extends Error {
   readonly status: number;
