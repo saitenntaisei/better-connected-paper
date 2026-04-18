@@ -149,6 +149,27 @@ func TestRetryOn429(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	cases := map[string]time.Duration{
+		"":         0,
+		"  ":       0,
+		"0":        0,
+		"3":        3 * time.Second,
+		"30":       30 * time.Second,
+		"nonsense": 0,
+	}
+	for in, want := range cases {
+		if got := parseRetryAfter(in); got != want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", in, got, want)
+		}
+	}
+	// HTTP-date path.
+	future := time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(future); got < 3*time.Second || got > 6*time.Second {
+		t.Errorf("parseRetryAfter(http-date) = %v, want ~5s", got)
+	}
+}
+
 func TestBatch(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/paper/batch", func(w http.ResponseWriter, r *http.Request) {

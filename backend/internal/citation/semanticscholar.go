@@ -264,9 +264,20 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 			resp.Body.Close()
 			return ErrNotFound
 		case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
+			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("semanticscholar: HTTP %d", resp.StatusCode)
-			if !sleepCtx(ctx, backoff(attempt)) {
+			// S2 often returns Retry-After on 429 — honor it when present,
+			// otherwise use exponential backoff. Clamp to 30s to avoid
+			// stalling the whole request beyond the Vercel function budget.
+			wait := backoff(attempt)
+			if retryAfter > 0 && retryAfter > wait {
+				wait = retryAfter
+			}
+			if wait > 30*time.Second {
+				wait = 30 * time.Second
+			}
+			if !sleepCtx(ctx, wait) {
 				return ctx.Err()
 			}
 		default:
@@ -287,6 +298,24 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 func backoff(attempt int) time.Duration {
 	base := 500 * time.Millisecond
 	return min(base*(1<<attempt), 8*time.Second)
+}
+
+// parseRetryAfter accepts either seconds ("30") or an HTTP-date. Unknown input
+// returns 0 so the caller falls back to its own backoff.
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
