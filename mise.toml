@@ -1,0 +1,69 @@
+[tools]
+go = "1.24"
+node = "22"
+
+[env]
+_.file = [".env"]
+
+[tasks.dev]
+description = "Start full dev stack (postgres + backend + frontend) via docker compose"
+run = "docker compose up --build"
+
+[tasks."dev:down"]
+description = "Stop and remove dev stack containers"
+run = "docker compose down"
+
+[tasks."dev:logs"]
+description = "Tail logs from the dev stack"
+run = "docker compose logs -f"
+
+[tasks."dev:backend"]
+description = "Run backend locally (requires running postgres)"
+dir = "backend"
+run = "go run ./cmd/server"
+
+[tasks."dev:frontend"]
+description = "Run frontend Vite dev server"
+dir = "frontend"
+run = "npm run dev"
+
+[tasks.migrate]
+description = "Apply Postgres migrations"
+dir = "backend"
+run = "go run ./cmd/server -migrate-only"
+
+[tasks.test]
+description = "Run backend + frontend tests"
+depends = ["test:backend", "test:frontend"]
+
+[tasks."test:backend"]
+dir = "backend"
+run = "go test ./..."
+
+[tasks."test:frontend"]
+dir = "frontend"
+run = "npm test -- --run"
+
+[tasks.lint]
+description = "Run backend + frontend linters"
+depends = ["lint:backend", "lint:frontend"]
+
+[tasks."lint:backend"]
+dir = "backend"
+run = "go vet ./... && test -z \"$(gofmt -l .)\""
+
+[tasks."lint:frontend"]
+dir = "frontend"
+run = "npm run lint"
+
+[tasks.build]
+description = "Production build backend + frontend"
+depends = ["build:backend", "build:frontend"]
+
+[tasks."build:backend"]
+dir = "backend"
+run = "go build -o bin/server ./cmd/server"
+
+[tasks."build:frontend"]
+dir = "frontend"
+run = "npm run build"
