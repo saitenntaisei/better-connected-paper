@@ -19,6 +19,14 @@ export default function App() {
   const [focusId, setFocusId] = useState<string | null>(urlSeed);
   const [showSimilarity, setShowSimilarity] = useState(false);
 
+  // Keep local seed in lock-step with the URL so back/forward navigation
+  // (popstate) actually rebuilds the graph. Without this, urlSeed changes
+  // inside the hook but App keeps showing the old seedId snapshot.
+  useEffect(() => {
+    setSeedId((current) => (current === urlSeed ? current : urlSeed));
+    setFocusId((current) => (current === urlSeed ? current : urlSeed));
+  }, [urlSeed]);
+
   useEffect(() => {
     if (!seedId) return;
     void build(seedId);
