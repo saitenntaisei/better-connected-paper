@@ -21,13 +21,14 @@ describe("App", () => {
   const originalFetch = globalThis.fetch;
 
   beforeEach(() => {
-    globalThis.fetch = vi.fn<typeof fetch>();
+    window.history.replaceState({}, "", "/");
   });
   afterEach(() => {
     globalThis.fetch = originalFetch;
   });
 
   it("renders the app shell", () => {
+    globalThis.fetch = vi.fn<typeof fetch>();
     render(<App />);
     expect(
       screen.getByRole("heading", { name: /Better Connected Paper/i }),
@@ -36,29 +37,29 @@ describe("App", () => {
   });
 
   it("search → select → graph build", async () => {
-    const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockResolvedValueOnce(
-      json({
-        total: 1,
-        results: [{ id: "p1", title: "Attention Is All You Need", year: 2017 }],
-      }),
-    );
-    fetchMock.mockResolvedValueOnce(
-      json({
-        seed: {
-          id: "p1",
-          title: "Attention Is All You Need",
-          similarity: 0,
-          isSeed: true,
-        },
-        nodes: [],
-        edges: [],
-        builtAt: "2026-04-18T00:00:00Z",
-      }),
-    );
-    fetchMock.mockResolvedValue(
-      json({ paperId: "p1", title: "Attention Is All You Need" }),
-    );
+    globalThis.fetch = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/search")) {
+          return json({
+            total: 1,
+            results: [{ id: "p1", title: "Attention Is All You Need", year: 2017 }],
+          });
+        }
+        if (url === "/api/graph/build") {
+          return json({
+            seed: { id: "p1", title: "Attention Is All You Need", similarity: 0, isSeed: true },
+            nodes: [],
+            edges: [],
+            builtAt: "2026-04-18T00:00:00Z",
+          });
+        }
+        if (url.startsWith("/api/paper/")) {
+          return json({ paperId: "p1", title: "Attention Is All You Need" });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
 
     const user = userEvent.setup();
     render(<App />);
@@ -73,7 +74,8 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByTestId("graph-stub")).toBeInTheDocument();
     });
-    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    const urls = vi.mocked(globalThis.fetch).mock.calls.map((c) => String(c[0]));
     expect(urls).toContain("/api/graph/build");
+    expect(new URL(window.location.href).searchParams.get("seed")).toBe("p1");
   });
 });

@@ -16,9 +16,10 @@ function ensureRegistered() {
 type Props = {
   data: GraphResponse;
   onSelectNode?: (id: string) => void;
+  showSimilarity?: boolean;
 };
 
-export function Graph({ data, onSelectNode }: Props) {
+export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
 
@@ -26,7 +27,7 @@ export function Graph({ data, onSelectNode }: Props) {
     ensureRegistered();
     if (!containerRef.current) return;
 
-    const { elements } = toElements(data);
+    const { elements } = toElements(data, { includeSimilarity: showSimilarity });
     const cy = cytoscape({
       container: containerRef.current,
       elements,
@@ -54,7 +55,7 @@ export function Graph({ data, onSelectNode }: Props) {
       cy.destroy();
       cyRef.current = null;
     };
-  }, [data, onSelectNode]);
+  }, [data, onSelectNode, showSimilarity]);
 
   return (
     <div

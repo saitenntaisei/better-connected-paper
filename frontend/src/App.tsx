@@ -1,27 +1,48 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { SearchBar } from "./components/SearchBar";
 import { ResultsList } from "./components/ResultsList";
 import { Graph } from "./components/Graph";
 import { PaperDetail } from "./components/PaperDetail";
 import { Legend } from "./components/Legend";
+import { Spinner } from "./components/Spinner";
 import { useSearch } from "./hooks/useSearch";
 import { useGraph } from "./hooks/useGraph";
+import { useUrlSeed } from "./hooks/useUrlSeed";
 import type { SearchResult } from "./types/api";
 
 export default function App() {
   const { state: searchState, runSearch } = useSearch({ limit: 10 });
   const { state: graphState, build } = useGraph();
-  const [selected, setSelected] = useState<SearchResult | null>(null);
-  const [focusId, setFocusId] = useState<string | null>(null);
+  const { seed: urlSeed, setSeed: setUrlSeed } = useUrlSeed();
+
+  const [seedId, setSeedId] = useState<string | null>(urlSeed);
+  const [focusId, setFocusId] = useState<string | null>(urlSeed);
+  const [showSimilarity, setShowSimilarity] = useState(false);
 
   useEffect(() => {
-    if (!selected) return;
-    setFocusId(selected.id);
-    void build(selected.id);
-  }, [selected, build]);
+    if (!seedId) return;
+    void build(seedId);
+  }, [seedId, build]);
+
+  const selectSeed = useCallback(
+    (result: SearchResult) => {
+      setSeedId(result.id);
+      setFocusId(result.id);
+      setUrlSeed(result.id);
+    },
+    [setUrlSeed],
+  );
 
   const loading = searchState.status === "loading";
-  const results = searchState.status === "success" ? searchState.data.results : [];
+  const results = useMemo(
+    () => (searchState.status === "success" ? searchState.data.results : []),
+    [searchState],
+  );
+  const seedTitle = useMemo(() => {
+    if (graphState.status === "success") return graphState.data.seed.title;
+    const hit = results.find((r) => r.id === seedId);
+    return hit?.title ?? seedId;
+  }, [graphState, results, seedId]);
   const yearRange = useMemo<[number, number] | undefined>(() => {
     if (graphState.status !== "success") return undefined;
     const years = graphState.data.nodes.map((n) => n.year ?? 0).filter((y) => y > 0);
@@ -53,31 +74,53 @@ export default function App() {
             {searchState.status === "success" ? (
               <span className="muted"> ({searchState.data.total.toLocaleString()} found)</span>
             ) : null}
+            {loading ? <Spinner label="Searching" /> : null}
           </h2>
           <ResultsList
             results={results}
-            selectedId={selected?.id}
-            onSelect={setSelected}
+            selectedId={seedId ?? undefined}
+            onSelect={selectSeed}
           />
         </section>
       )}
 
-      {selected ? (
+      {seedId ? (
         <section className="graph-section" aria-labelledby="graph-heading">
-          <h2 id="graph-heading" className="section-heading">
-            Citation graph
-            <span className="muted"> — seed: {selected.title}</span>
-          </h2>
+          <div className="graph-header">
+            <h2 id="graph-heading" className="section-heading">
+              Citation graph
+              <span className="muted"> — seed: {seedTitle}</span>
+            </h2>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={showSimilarity}
+                onChange={(e) => setShowSimilarity(e.target.checked)}
+              />
+              Show similarity links
+            </label>
+          </div>
           <div className="graph-layout">
             <div className="graph-main">
-              {graphState.status === "loading" && (
-                <p className="muted" role="status">Building graph…</p>
-              )}
+              {graphState.status === "loading" && <Spinner label="Building graph" />}
               {graphState.status === "error" && (
-                <p className="error" role="alert">{graphState.error}</p>
+                <div className="error-box" role="alert">
+                  <p>{graphState.error}</p>
+                  <button
+                    type="button"
+                    onClick={() => void build(seedId, true)}
+                    className="retry"
+                  >
+                    Retry
+                  </button>
+                </div>
               )}
               {graphState.status === "success" && (
-                <Graph data={graphState.data} onSelectNode={setFocusId} />
+                <Graph
+                  data={graphState.data}
+                  onSelectNode={setFocusId}
+                  showSimilarity={showSimilarity}
+                />
               )}
             </div>
             <div className="graph-side">

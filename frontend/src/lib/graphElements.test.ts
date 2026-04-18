@@ -2,21 +2,22 @@ import { describe, expect, it } from "vitest";
 import { nodeSize, toElements, yearColor } from "./graphElements";
 import type { GraphResponse } from "../types/api";
 
+const sample: GraphResponse = {
+  seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
+  nodes: [
+    { id: "S", title: "Seed", year: 2017, similarity: 0, isSeed: true, citationCount: 90000 },
+    { id: "A", title: "Ancestor", year: 2010, similarity: 0.8, citationCount: 1200 },
+  ],
+  edges: [
+    { source: "S", target: "A", kind: "cite", weight: 1 },
+    { source: "A", target: "S", kind: "similarity", weight: 0.7 },
+  ],
+  builtAt: "2026-04-18T00:00:00Z",
+};
+
 describe("toElements", () => {
   it("maps nodes and directed citation edges to cytoscape elements", () => {
-    const resp: GraphResponse = {
-      seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
-      nodes: [
-        { id: "S", title: "Seed", year: 2017, similarity: 0, isSeed: true, citationCount: 90000 },
-        { id: "A", title: "Ancestor", year: 2010, similarity: 0.8, citationCount: 1200 },
-      ],
-      edges: [
-        { source: "S", target: "A", kind: "cite", weight: 1 },
-        { source: "A", target: "S", kind: "similarity", weight: 0.7 },
-      ],
-      builtAt: "2026-04-18T00:00:00Z",
-    };
-    const { elements, yearRange } = toElements(resp);
+    const { elements, yearRange } = toElements(sample);
     expect(yearRange).toEqual([2010, 2017]);
     const nodes = elements.filter((e) => e.group === "nodes");
     const edges = elements.filter((e) => e.group === "edges");
@@ -31,6 +32,13 @@ describe("toElements", () => {
     expect(cite.data).toMatchObject({ source: "S", target: "A", kind: "cite" });
     const sim = edges.find((e) => e.classes === "similarity")!;
     expect(sim.data.kind).toBe("similarity");
+  });
+
+  it("drops similarity edges when includeSimilarity is false", () => {
+    const { elements } = toElements(sample, { includeSimilarity: false });
+    const edges = elements.filter((e) => e.group === "edges");
+    expect(edges).toHaveLength(1);
+    expect(edges[0].classes).toBe("cite");
   });
 });
 

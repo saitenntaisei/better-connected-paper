@@ -6,12 +6,19 @@ export type ElementData = {
   yearRange: [number, number];
 };
 
+export type ElementOptions = {
+  includeSimilarity?: boolean;
+};
+
 /**
  * Converts the backend graph payload into Cytoscape element definitions.
  * Each node carries `size` (citation-scaled) and `color` (year-gradient) as
  * data() properties so the stylesheet can map them with mapData().
  */
-export function toElements(response: GraphResponse): ElementData {
+export function toElements(
+  response: GraphResponse,
+  opts: ElementOptions = {},
+): ElementData {
   const years = response.nodes
     .map((n) => n.year ?? 0)
     .filter((y) => y > 0);
@@ -39,7 +46,9 @@ export function toElements(response: GraphResponse): ElementData {
     });
   }
 
+  const includeSimilarity = opts.includeSimilarity ?? true;
   for (const e of response.edges) {
+    if (e.kind === "similarity" && !includeSimilarity) continue;
     elements.push({
       group: "edges",
       data: {
