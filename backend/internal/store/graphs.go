@@ -13,7 +13,11 @@ import (
 const DefaultGraphTTL = 30 * 24 * time.Hour
 
 // GetGraph returns the cached JSON payload if it has not expired.
+// A nil DB short-circuits to ErrNotFound so handlers can treat the cache as optional.
 func (db *DB) GetGraph(ctx context.Context, seedID string) (json.RawMessage, error) {
+	if db == nil || db.Pool == nil {
+		return nil, ErrNotFound
+	}
 	const q = `
         SELECT payload FROM graphs
         WHERE seed_id = $1 AND ttl_until > now()
@@ -28,8 +32,11 @@ func (db *DB) GetGraph(ctx context.Context, seedID string) (json.RawMessage, err
 	return payload, nil
 }
 
-// PutGraph stores the payload with a fresh TTL.
+// PutGraph stores the payload with a fresh TTL. No-op when DB is nil.
 func (db *DB) PutGraph(ctx context.Context, seedID string, payload json.RawMessage, ttl time.Duration) error {
+	if db == nil || db.Pool == nil {
+		return nil
+	}
 	if ttl <= 0 {
 		ttl = DefaultGraphTTL
 	}

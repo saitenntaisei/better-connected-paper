@@ -8,7 +8,7 @@ import (
 )
 
 func TestHealth(t *testing.T) {
-	r := NewRouter()
+	r := NewRouter(Deps{})
 	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -29,7 +29,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestNotFound(t *testing.T) {
-	r := NewRouter()
+	r := NewRouter(Deps{})
 	req := httptest.NewRequest(http.MethodGet, "/nope", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)

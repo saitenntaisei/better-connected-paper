@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/saitenntaisei/better-connected-paper/internal/api"
+	"github.com/saitenntaisei/better-connected-paper/internal/citation"
+	"github.com/saitenntaisei/better-connected-paper/internal/graph"
 	"github.com/saitenntaisei/better-connected-paper/internal/store"
 )
 
@@ -62,9 +64,13 @@ func main() {
 		return
 	}
 
+	s2 := citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
+	builder := &graph.Builder{S2: s2}
+	deps := api.Deps{S2: s2, DB: db, Builder: builder}
+
 	srv := &http.Server{
 		Addr:              net.JoinHostPort("0.0.0.0", port),
-		Handler:           api.NewRouter(),
+		Handler:           api.NewRouter(deps),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

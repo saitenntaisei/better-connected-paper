@@ -24,8 +24,9 @@ func (db *DB) GetPaper(ctx context.Context, id string) (*citation.Paper, error) 
 }
 
 // GetPapers returns cached papers matching any of the given ids (order not preserved).
+// A nil DB returns nil/nil so callers can transparently skip the cache.
 func (db *DB) GetPapers(ctx context.Context, ids []string) ([]citation.Paper, error) {
-	if len(ids) == 0 {
+	if db == nil || db.Pool == nil || len(ids) == 0 {
 		return nil, nil
 	}
 	const q = `
@@ -65,9 +66,9 @@ func (db *DB) GetPapers(ctx context.Context, ids []string) ([]citation.Paper, er
 	return out, rows.Err()
 }
 
-// UpsertPapers writes papers to the cache, replacing existing rows.
+// UpsertPapers writes papers to the cache, replacing existing rows. No-op when DB is nil.
 func (db *DB) UpsertPapers(ctx context.Context, papers []citation.Paper) error {
-	if len(papers) == 0 {
+	if db == nil || db.Pool == nil || len(papers) == 0 {
 		return nil
 	}
 	const q = `
