@@ -26,6 +26,16 @@ func TestHealth(t *testing.T) {
 	if _, ok := body["time"]; !ok {
 		t.Error("expected time field in response")
 	}
+	persistence, ok := body["persistence"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected persistence object, got %T: %v", body["persistence"], body["persistence"])
+	}
+	if persistence["enabled"] != false {
+		t.Errorf("persistence.enabled = %v, want false when DB is nil", persistence["enabled"])
+	}
+	if persistence["healthy"] != false {
+		t.Errorf("persistence.healthy = %v, want false when DB is nil", persistence["healthy"])
+	}
 }
 
 func TestNotFound(t *testing.T) {

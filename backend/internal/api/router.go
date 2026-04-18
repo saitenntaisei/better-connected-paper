@@ -55,7 +55,7 @@ func NewRouter(deps Deps) *Router {
 		MaxAge:           300,
 	}))
 
-	r.Get("/api/health", Health)
+	r.Get("/api/health", deps.Health)
 	r.Get("/api/search", deps.Search)
 	r.Get("/api/paper/{id}", deps.Paper)
 	r.Post("/api/graph/build", deps.BuildGraph)

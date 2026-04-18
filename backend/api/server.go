@@ -5,6 +5,7 @@ package handler
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -32,14 +33,25 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 func initHandler() {
 	ctx := context.Background()
 
+	// DB is optional — S2-backed reads still work without the cache. But any
+	// failure here (bad DSN, unreachable host, migration error) gets logged
+	// loudly so ops can spot it in `vercel logs` instead of silently serving
+	// every request uncached. /api/health also reports the degraded state.
 	var db *store.DB
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+	if dsn := os.Getenv("DATABASE_URL"); dsn == "" {
+		log.Printf("init: DATABASE_URL unset — running without persistence cache")
+	} else {
 		openCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if opened, err := store.Open(openCtx, dsn); err == nil {
+		opened, err := store.Open(openCtx, dsn)
+		cancel()
+		if err != nil {
+			log.Printf("init: store.Open failed, persistence cache disabled: %v", err)
+		} else {
 			db = opened
 			migrateCtx, mc := context.WithTimeout(ctx, 30*time.Second)
-			_ = db.Migrate(migrateCtx)
+			if err := db.Migrate(migrateCtx); err != nil {
+				log.Printf("init: db.Migrate failed: %v", err)
+			}
 			mc()
 		}
 	}
