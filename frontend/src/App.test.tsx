@@ -1,7 +1,14 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App from "./App";
+
+vi.mock("./components/Graph", () => ({
+  Graph: ({ data }: { data: { seed: { title: string } } }) => (
+    <div data-testid="graph-stub">graph:{data.seed.title}</div>
+  ),
+}));
+
+const { default: App } = await import("./App");
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -28,26 +35,43 @@ describe("App", () => {
     expect(screen.getByRole("searchbox")).toBeInTheDocument();
   });
 
-  it("searches, lists results, and updates the selection panel on click", async () => {
-    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+  it("search → select → graph build", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
       json({
-        total: 2,
-        results: [
-          { id: "p1", title: "Attention Is All You Need", year: 2017 },
-          { id: "p2", title: "BERT", year: 2018 },
-        ],
+        total: 1,
+        results: [{ id: "p1", title: "Attention Is All You Need", year: 2017 }],
       }),
     );
+    fetchMock.mockResolvedValueOnce(
+      json({
+        seed: {
+          id: "p1",
+          title: "Attention Is All You Need",
+          similarity: 0,
+          isSeed: true,
+        },
+        nodes: [],
+        edges: [],
+        builtAt: "2026-04-18T00:00:00Z",
+      }),
+    );
+
     const user = userEvent.setup();
     render(<App />);
     await user.type(screen.getByRole("searchbox"), "transformers");
     await user.click(screen.getByRole("button", { name: /search/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/Attention Is All You Need/i)).toBeInTheDocument();
+      expect(screen.getByText(/Attention Is All You Need/)).toBeInTheDocument();
     });
+    await user.click(screen.getByRole("option", { name: /Attention Is All You Need/ }));
 
-    await user.click(screen.getByRole("option", { name: /BERT/i }));
-    expect(screen.getByRole("complementary")).toHaveTextContent(/BERT/i);
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toBeInTheDocument();
+    });
+    const calls = fetchMock.mock.calls;
+    expect(calls.at(-1)?.[0]).toBe("/api/graph/build");
+    expect((calls.at(-1)?.[1] as RequestInit).method).toBe("POST");
   });
 });

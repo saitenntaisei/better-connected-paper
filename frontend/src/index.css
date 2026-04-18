@@ -164,3 +164,15 @@ body {
 .selection-abstract {
   margin: 0 0 0.75rem;
 }
+
+.graph-section {
+  margin-top: 1.5rem;
+}
+
+.graph-container {
+  width: 100%;
+  height: 560px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
