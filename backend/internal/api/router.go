@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -11,6 +13,29 @@ import (
 
 type Router struct {
 	chi.Router
+}
+
+var defaultLocalOrigins = []string{"http://localhost:5173", "http://localhost:3000"}
+
+// resolveAllowedOrigins prefers the ALLOWED_ORIGINS env var (comma-separated).
+// "*" allows any origin — useful for previews; never use with credentials.
+// Empty env falls back to localhost defaults so dev keeps working.
+func resolveAllowedOrigins(getenv func(string) string) []string {
+	raw := strings.TrimSpace(getenv("ALLOWED_ORIGINS"))
+	if raw == "" {
+		return defaultLocalOrigins
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return defaultLocalOrigins
+	}
+	return out
 }
 
 // NewRouter wires middleware + all /api/* routes. Any field on deps may be nil;
@@ -23,7 +48,7 @@ func NewRouter(deps Deps) *Router {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(120 * time.Second))
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:5173", "http://localhost:3000"},
+		AllowedOrigins:   resolveAllowedOrigins(os.Getenv),
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
 		AllowedHeaders:   []string{"Content-Type", "Accept"},
 		AllowCredentials: false,

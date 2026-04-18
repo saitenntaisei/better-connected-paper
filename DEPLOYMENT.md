@@ -58,6 +58,7 @@ via `sync.Once` so the cold-start cost is paid once per instance.
    # backend
    cd backend
    vercel env add SEMANTIC_SCHOLAR_API_KEY   # optional but strongly recommended
+   vercel env add ALLOWED_ORIGINS            # e.g. https://bcp-frontend.vercel.app
    # DATABASE_URL is provided by the Neon integration — no manual add needed
 
    # frontend
@@ -68,6 +69,9 @@ via `sync.Once` so the cold-start cost is paid once per instance.
    Use `Production`, `Preview`, and `Development` scopes as appropriate.
    `VITE_API_BASE` is read at build time by `frontend/src/api/client.ts`
    and falls back to `/api` if unset.
+   `ALLOWED_ORIGINS` is a comma-separated CORS allowlist; without it, the
+   backend only accepts `http://localhost:5173` and `http://localhost:3000`,
+   so cross-origin calls from the deployed frontend will fail.
 
 ## Deploy
 
