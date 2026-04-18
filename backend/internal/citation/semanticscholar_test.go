@@ -170,6 +170,23 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+func TestExternalIDsMixedTypes(t *testing.T) {
+	raw := []byte(`{"externalIds":{"DOI":"10.1/x","CorpusId":12345,"ArXiv":"2301.00001"}}`)
+	var p Paper
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p.ExternalIDs["DOI"] != "10.1/x" {
+		t.Errorf("DOI: %q", p.ExternalIDs["DOI"])
+	}
+	if p.ExternalIDs["CorpusId"] != "12345" {
+		t.Errorf("CorpusId: %q", p.ExternalIDs["CorpusId"])
+	}
+	if p.ExternalIDs["ArXiv"] != "2301.00001" {
+		t.Errorf("ArXiv: %q", p.ExternalIDs["ArXiv"])
+	}
+}
+
 func TestBatch(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/paper/batch", func(w http.ResponseWriter, r *http.Request) {

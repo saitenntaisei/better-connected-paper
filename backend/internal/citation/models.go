@@ -1,23 +1,63 @@
 package citation
 
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
 // Paper is the canonical shape returned by Semantic Scholar.
 // JSON tags match S2 Graph API v1 responses.
 // References/Citations are only populated when the caller asks for them
 // (e.g. fields=references.paperId or citations.paperId).
 type Paper struct {
-	PaperID         string            `json:"paperId"`
-	Title           string            `json:"title"`
-	Abstract        string            `json:"abstract,omitempty"`
-	Year            int               `json:"year,omitempty"`
-	Venue           string            `json:"venue,omitempty"`
-	Authors         []Author          `json:"authors,omitempty"`
-	CitationCount   int               `json:"citationCount,omitempty"`
-	ReferenceCount  int               `json:"referenceCount,omitempty"`
-	InfluentialCite int               `json:"influentialCitationCount,omitempty"`
-	ExternalIDs     map[string]string `json:"externalIds,omitempty"`
-	URL             string            `json:"url,omitempty"`
-	References      []Paper           `json:"references,omitempty"`
-	Citations       []Paper           `json:"citations,omitempty"`
+	PaperID         string      `json:"paperId"`
+	Title           string      `json:"title"`
+	Abstract        string      `json:"abstract,omitempty"`
+	Year            int         `json:"year,omitempty"`
+	Venue           string      `json:"venue,omitempty"`
+	Authors         []Author    `json:"authors,omitempty"`
+	CitationCount   int         `json:"citationCount,omitempty"`
+	ReferenceCount  int         `json:"referenceCount,omitempty"`
+	InfluentialCite int         `json:"influentialCitationCount,omitempty"`
+	ExternalIDs     ExternalIDs `json:"externalIds,omitempty"`
+	URL             string      `json:"url,omitempty"`
+	References      []Paper     `json:"references,omitempty"`
+	Citations       []Paper     `json:"citations,omitempty"`
+}
+
+// ExternalIDs holds identifiers like DOI, ArXiv, CorpusId. S2 mixes strings
+// and numbers (CorpusId is an int), so we coerce everything to string on
+// decode to keep downstream code simple.
+type ExternalIDs map[string]string
+
+// UnmarshalJSON accepts string, number, or bool values and stringifies them.
+func (e *ExternalIDs) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		s := strings.TrimSpace(string(v))
+		if s == "" || s == "null" {
+			continue
+		}
+		if s[0] == '"' {
+			var str string
+			if err := json.Unmarshal(v, &str); err != nil {
+				return fmt.Errorf("externalIds[%s]: %w", k, err)
+			}
+			out[k] = str
+		} else {
+			out[k] = s
+		}
+	}
+	*e = out
+	return nil
 }
 
 // RefIDs returns the paperIds of papers this paper cites.

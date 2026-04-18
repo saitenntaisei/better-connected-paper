@@ -68,7 +68,7 @@ func ToNode(p citation.Paper) Node {
 		Authors:        authors,
 		CitationCount:  p.CitationCount,
 		ReferenceCount: p.ReferenceCount,
-		ExternalIDs:    p.ExternalIDs,
+		ExternalIDs:    map[string]string(p.ExternalIDs),
 		URL:            p.URL,
 	}
 }

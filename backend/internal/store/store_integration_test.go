@@ -48,7 +48,7 @@ func TestUpsertAndGetPapers(t *testing.T) {
 			PaperID: "P1", Title: "Alpha", Year: 2020,
 			Authors:       []citation.Author{{Name: "Ada"}},
 			CitationCount: 42,
-			ExternalIDs:   map[string]string{"DOI": "10.1/alpha"},
+			ExternalIDs:   citation.ExternalIDs{"DOI": "10.1/alpha"},
 		},
 		{PaperID: "P2", Title: "Beta"},
 	}
