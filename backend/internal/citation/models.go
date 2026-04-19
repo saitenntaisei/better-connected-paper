@@ -24,6 +24,22 @@ type Paper struct {
 	URL             string      `json:"url,omitempty"`
 	References      []Paper     `json:"references,omitempty"`
 	Citations       []Paper     `json:"citations,omitempty"`
+
+	// CitationsUnknown is true when the provider can't supply a complete
+	// cited-by list for this paper (e.g. OpenAlex skips enrichment for
+	// papers with citedByCount > the per-page cap). In that case Citations
+	// is empty and MUST NOT be treated as "this paper has no citers" — the
+	// cache layer keys off this flag to avoid persisting a misleading
+	// empty cite set as the authoritative one.
+	CitationsUnknown bool `json:"-"`
+
+	// MergedFromID is the secondary provider's paperId when HybridClient
+	// supplemented this paper's refs/cites from a different provider than
+	// PaperID lives in. Downstream papers fetched from the secondary refer
+	// to this paper by MergedFromID, not PaperID — callers building a
+	// cross-provider graph use this to canonicalize those references onto
+	// the primary PaperID so the seed does not show up as a duplicate node.
+	MergedFromID string `json:"-"`
 }
 
 // ExternalIDs holds identifiers like DOI, ArXiv, CorpusId. S2 mixes strings

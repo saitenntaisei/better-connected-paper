@@ -108,7 +108,7 @@ func (c *Client) GetPaper(ctx context.Context, id string, fields []string) (*Pap
 
 // GetReferences returns papers cited by id.
 func (c *Client) GetReferences(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
-	papers, err := c.listPapers(ctx, fmt.Sprintf("/paper/%s/references", url.PathEscape(id)), limit, fields, "citedPaper")
+	papers, err := c.listPapers(ctx, fmt.Sprintf("/paper/%s/references", url.PathEscape(id)), 0, limit, fields, "citedPaper")
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,19 @@ func (c *Client) GetReferences(ctx context.Context, id string, limit int, fields
 
 // GetCitations returns papers citing id.
 func (c *Client) GetCitations(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
-	papers, err := c.listPapers(ctx, fmt.Sprintf("/paper/%s/citations", url.PathEscape(id)), limit, fields, "citingPaper")
+	papers, err := c.listPapers(ctx, fmt.Sprintf("/paper/%s/citations", url.PathEscape(id)), 0, limit, fields, "citingPaper")
+	if err != nil {
+		return nil, err
+	}
+	return papers, nil
+}
+
+// GetCitationsFrom returns citers starting at offset, up to limit items. It
+// exists to paginate past S2's inline citations cap (1000) without re-fetching
+// the same first 1000. Used by ResolvingTertiary to catch recent preprints
+// that fall into the 1000-2000 offset band on heavily-cited seeds.
+func (c *Client) GetCitationsFrom(ctx context.Context, id string, offset, limit int, fields []string) ([]Paper, error) {
+	papers, err := c.listPapers(ctx, fmt.Sprintf("/paper/%s/citations", url.PathEscape(id)), offset, limit, fields, "citingPaper")
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +167,7 @@ func (c *Client) GetPaperBatch(ctx context.Context, ids []string, fields []strin
 	return out, nil
 }
 
-func (c *Client) listPapers(ctx context.Context, path string, limit int, fields []string, wrapKey string) ([]Paper, error) {
+func (c *Client) listPapers(ctx context.Context, path string, startOffset, limit int, fields []string, wrapKey string) ([]Paper, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -167,7 +179,7 @@ func (c *Client) listPapers(ctx context.Context, path string, limit int, fields 
 	}
 
 	var out []Paper
-	offset := 0
+	offset := startOffset
 	for len(out) < limit {
 		q := url.Values{}
 		q.Set("limit", strconv.Itoa(perPage))

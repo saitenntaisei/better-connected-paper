@@ -1,0 +1,308 @@
+package citation
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+)
+
+// ResolvingTertiary wraps an inner PaperProvider (typically a Semantic
+// Scholar client) so its refs/cites come back in the primary's W-ID space
+// rather than the inner provider's native hex paperId space. The hybrid
+// graph builder's batch router assumes refs stay on one ID space; without
+// this adapter, S2 hex refs would get shipped to OpenCitations (which
+// can't resolve them) and silently drop.
+//
+// The adapter:
+//  1. Enriches the fields list so the inner provider also returns
+//     externalIds on each ref/cite.
+//  2. Collects the DOIs from those externalIds and calls the injected
+//     Resolver (OpenAlex in practice) to translate them into W-IDs.
+//  3. Replaces refs/cites with minimal Papers carrying only the resolved
+//     W-IDs — the builder only needs PaperID for ranking.
+//  4. Clears the outer Paper's PaperID so HybridClient.mergeFromSecondary
+//     doesn't set MergedFromID to an S2 hex (the graph already lives in
+//     primary space thanks to the translation above).
+type ResolvingTertiary struct {
+	Inner    PaperProvider
+	Resolver DOIResolver
+	Logger   *slog.Logger
+	// CiterSupplementLimit caps extra citers fetched via paginated lookup
+	// when the inline response hits S2's 1000-item cap. Inline and paginated
+	// endpoints use different orderings on S2, so offsetting past 1000
+	// surfaces a disjoint band — where recent preprints (e.g. the 2024
+	// robotics cluster that cites Octo) tend to cluster. 0 disables.
+	CiterSupplementLimit int
+}
+
+// citerLister lets the tertiary supplement the inline 1000-item cap without
+// pulling a full *Client dependency. *Client satisfies it; tests can stub it.
+type citerLister interface {
+	GetCitationsFrom(ctx context.Context, id string, offset, limit int, fields []string) ([]Paper, error)
+}
+
+// Search passes through; hybrid uses its result only to grab a hit.PaperID
+// which then flows back into GetPaper, where translation happens.
+func (r *ResolvingTertiary) Search(ctx context.Context, query string, limit int, fields []string) (*SearchResponse, error) {
+	if r.Inner == nil {
+		return &SearchResponse{}, nil
+	}
+	return r.Inner.Search(ctx, query, limit, fields)
+}
+
+// GetPaper calls inner with enriched fields, then swaps refs/cites in-place
+// with DOI-resolved primary-space Papers.
+func (r *ResolvingTertiary) GetPaper(ctx context.Context, id string, fields []string) (*Paper, error) {
+	if r.Inner == nil {
+		return nil, ErrNotFound
+	}
+	p, err := r.Inner.GetPaper(ctx, id, enrichTertiaryFields(fields))
+	if err != nil || p == nil {
+		return p, err
+	}
+	r.supplementCiters(ctx, id, p)
+	if refs := r.translate(ctx, p.References); refs != nil {
+		p.References = refs
+		if p.ReferenceCount < len(refs) {
+			p.ReferenceCount = len(refs)
+		}
+	} else {
+		p.References = nil
+	}
+	if cites := r.translate(ctx, p.Citations); cites != nil {
+		p.Citations = cites
+	} else {
+		p.Citations = nil
+	}
+	p.PaperID = ""
+	return p, nil
+}
+
+// supplementCiters merges paginated citers (offset ≥ 1000) into the inline
+// response when S2 truncated at its 1000-item cap. The two endpoints sort
+// citers differently, so the paginated tail reliably contains papers the
+// inline response dropped — most visibly the recent-preprint band that makes
+// or breaks the Prior Works cluster in our graph builds.
+func (r *ResolvingTertiary) supplementCiters(ctx context.Context, id string, p *Paper) {
+	if r.CiterSupplementLimit <= 0 || p == nil {
+		return
+	}
+	const inlineCap = 1000
+	if len(p.Citations) < inlineCap {
+		return
+	}
+	if p.CitationCount > 0 && p.CitationCount <= inlineCap {
+		return
+	}
+	lister, ok := r.Inner.(citerLister)
+	if !ok {
+		return
+	}
+	extras, err := lister.GetCitationsFrom(ctx, id, inlineCap, r.CiterSupplementLimit, []string{"paperId", "externalIds"})
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("tertiary: citer supplement failed", "id", id, "err", err)
+		}
+		return
+	}
+	if len(extras) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(p.Citations)+len(extras))
+	for i := range p.Citations {
+		if pid := p.Citations[i].PaperID; pid != "" {
+			seen[pid] = struct{}{}
+		}
+	}
+	added := 0
+	for i := range extras {
+		pid := extras[i].PaperID
+		if pid == "" {
+			continue
+		}
+		if _, dup := seen[pid]; dup {
+			continue
+		}
+		seen[pid] = struct{}{}
+		p.Citations = append(p.Citations, extras[i])
+		added++
+	}
+	if r.Logger != nil && added > 0 {
+		r.Logger.Info("tertiary: citer supplement", "id", id, "inline", inlineCap, "added", added, "total", len(p.Citations))
+	}
+}
+
+// GetPaperBatch fetches a batch of papers (IDs may be DOI:/ARXIV:/hex) via
+// the inner provider, then replaces each paper's hex refs with W-IDs using
+// the DOI resolver. Unlike GetPaper this does NOT supplement cites — cites
+// are expensive to enrich per-paper and the Builder's first-hop path scores
+// candidates off refs and the seed's citers, so skipping cites here keeps
+// the batch cost bounded. Top-level ExternalIDs is preserved so callers can
+// match returned papers back to their input DOIs.
+func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+	if r.Inner == nil {
+		return nil, nil
+	}
+	papers, err := r.Inner.GetPaperBatch(ctx, ids, enrichTertiaryFields(fields))
+	if err != nil || len(papers) == 0 {
+		return papers, err
+	}
+	r.translateRefsBatch(ctx, papers)
+	for i := range papers {
+		papers[i].Citations = nil
+	}
+	return papers, nil
+}
+
+// translateRefsBatch dedupes DOIs across every paper's refs, calls the
+// resolver exactly once, and swaps each paper's hex refs with the W-ID
+// versions. Papers with no resolvable refs come back with References=nil.
+// This is O(N papers + D unique DOIs) regardless of paper count — the key
+// reason we amortize the resolver call across the whole batch.
+func (r *ResolvingTertiary) translateRefsBatch(ctx context.Context, papers []Paper) {
+	if r.Resolver == nil {
+		for i := range papers {
+			papers[i].References = nil
+		}
+		return
+	}
+	doiSet := make(map[string]struct{})
+	for i := range papers {
+		for j := range papers[i].References {
+			d := strings.ToLower(strings.TrimSpace(papers[i].References[j].ExternalIDs["DOI"]))
+			if d == "" {
+				continue
+			}
+			doiSet[d] = struct{}{}
+		}
+	}
+	if len(doiSet) == 0 {
+		for i := range papers {
+			papers[i].References = nil
+		}
+		return
+	}
+	dois := make([]string, 0, len(doiSet))
+	for d := range doiSet {
+		dois = append(dois, d)
+	}
+	resolved, err := r.Resolver(ctx, dois)
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("tertiary: batch DOI resolver failed", "err", err, "count", len(dois))
+		}
+		for i := range papers {
+			papers[i].References = nil
+		}
+		return
+	}
+	doiToWID := make(map[string]string, len(resolved))
+	for _, rp := range resolved {
+		d := strings.ToLower(strings.TrimSpace(rp.ExternalIDs["DOI"]))
+		if d == "" || rp.PaperID == "" {
+			continue
+		}
+		doiToWID[d] = rp.PaperID
+	}
+	for i := range papers {
+		if len(papers[i].References) == 0 {
+			continue
+		}
+		translated := make([]Paper, 0, len(papers[i].References))
+		seen := make(map[string]struct{}, len(papers[i].References))
+		for _, ref := range papers[i].References {
+			d := strings.ToLower(strings.TrimSpace(ref.ExternalIDs["DOI"]))
+			if d == "" {
+				continue
+			}
+			wid, ok := doiToWID[d]
+			if !ok {
+				continue
+			}
+			if _, dup := seen[wid]; dup {
+				continue
+			}
+			seen[wid] = struct{}{}
+			translated = append(translated, Paper{PaperID: wid})
+		}
+		if len(translated) == 0 {
+			papers[i].References = nil
+			continue
+		}
+		papers[i].References = translated
+		if papers[i].ReferenceCount < len(translated) {
+			papers[i].ReferenceCount = len(translated)
+		}
+	}
+}
+
+// translate collects DOIs from the items' externalIds and resolves them
+// to W-ID Papers via the injected resolver. Items without DOIs are
+// dropped — the builder only needs PaperIDs, and an un-resolvable ref
+// can't contribute to the graph anyway. Returns nil when nothing
+// resolved (caller treats nil as "clear the field").
+func (r *ResolvingTertiary) translate(ctx context.Context, items []Paper) []Paper {
+	if len(items) == 0 || r.Resolver == nil {
+		return nil
+	}
+	dois := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for i := range items {
+		d := strings.TrimSpace(items[i].ExternalIDs["DOI"])
+		if d == "" {
+			continue
+		}
+		d = strings.ToLower(d)
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		dois = append(dois, d)
+	}
+	if len(dois) == 0 {
+		return nil
+	}
+	resolved, err := r.Resolver(ctx, dois)
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("tertiary: DOI resolver failed", "err", err, "count", len(dois))
+		}
+		return nil
+	}
+	if len(resolved) == 0 {
+		return nil
+	}
+	return resolved
+}
+
+// enrichTertiaryFields adds references.externalIds / citations.externalIds
+// whenever the caller asked for refs or cites, so the inner provider
+// returns DOIs that translate() can feed into the resolver. Existing
+// entries are preserved untouched.
+func enrichTertiaryFields(fields []string) []string {
+	wantRefs, wantCites := false, false
+	hasRefExt, hasCiteExt := false, false
+	for _, f := range fields {
+		switch f {
+		case "references.externalIds":
+			hasRefExt = true
+		case "citations.externalIds":
+			hasCiteExt = true
+		}
+		if strings.HasPrefix(f, "references") {
+			wantRefs = true
+		}
+		if strings.HasPrefix(f, "citations") {
+			wantCites = true
+		}
+	}
+	out := make([]string, 0, len(fields)+2)
+	out = append(out, fields...)
+	if wantRefs && !hasRefExt {
+		out = append(out, "references.externalIds")
+	}
+	if wantCites && !hasCiteExt {
+		out = append(out, "citations.externalIds")
+	}
+	return out
+}

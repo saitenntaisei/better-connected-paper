@@ -38,14 +38,14 @@ optional similarity overlay.
                                                    ┌────────────────┼────────────────┐
                                                    ▼                                 ▼
                                       ┌──────────────────────┐         ┌──────────────────────┐
-                                      │ Semantic Scholar API │         │  Postgres (Neon /    │
-                                      │ /paper/search        │         │  docker compose)     │
-                                      │ /paper/{id}          │         │  papers, edges,      │
-                                      │ /paper/batch         │         │  graph_cache (TTL 30d)│
+                                      │ OpenAlex (default)   │         │  Postgres (Neon /    │
+                                      │ or Semantic Scholar  │         │  docker compose)     │
+                                      │ search / work / batch│         │  papers, edges,      │
+                                      │                      │         │  graph_cache (TTL 30d)│
                                       └──────────────────────┘         └──────────────────────┘
 ```
 
-- `backend/internal/citation` — Semantic Scholar client with rate limiting + retries
+- `backend/internal/citation` — OpenAlex (primary), OpenCitations (secondary supplement), and Semantic Scholar (opt-in) clients with rate limiting + retries; selected by `CITATION_PROVIDER` / `CITATION_SECONDARY` / `CITATION_TERTIARY`
 - `backend/internal/graph` — 2-hop expansion, similarity scoring, directed edge construction
 - `backend/internal/store` — pgx pool + embedded migrations + cache layer
 - `backend/internal/api` — chi router + HTTP handlers
@@ -58,7 +58,7 @@ optional similarity overlay.
 
 ```
 Input: seed paper S
-1. Fetch S (metadata, references, citations) from Semantic Scholar
+1. Fetch S (metadata, references, citations) from the configured provider (OpenAlex by default)
 2. Pool P = refs(S) ∪ cites(S)   (first-hop neighbors)
 3. Batch-fetch metadata + refs + cites for every p ∈ P     (one /paper/batch call)
 4. Score each p:
@@ -81,7 +81,7 @@ Input: seed paper S
 | --------------- | ----------------------------------------------- | ----------------------------------------------- |
 | Backend         | Go 1.25 · [chi](https://github.com/go-chi/chi) · [pgx/v5](https://github.com/jackc/pgx) | fast, stdlib-compatible, great Postgres story  |
 | Migrations      | [golang-migrate](https://github.com/golang-migrate/migrate), embedded | reproducible, idempotent on cold-start          |
-| Rate limiting   | `golang.org/x/time/rate`                        | respects Semantic Scholar's public API budget   |
+| Rate limiting   | `golang.org/x/time/rate`                        | respects OpenAlex (10 req/s), OpenCitations (polite pool), and opt-in Semantic Scholar (1 req/3s anon) budgets |
 | Frontend        | React 19 · TypeScript 5.7 · Vite 6             | fastest DX, matches Vercel defaults             |
 | Graph           | [Cytoscape.js](https://js.cytoscape.org/) · [cose-bilkent](https://github.com/cytoscape/cytoscape.js-cose-bilkent) | directed arrows built in, good up to ~1k nodes  |
 | Tests           | `go test` · Vitest 3 · @testing-library/react  | same shape on both sides                        |
@@ -93,7 +93,8 @@ Input: seed paper S
 ## Quick start
 
 ```bash
-cp .env.example .env        # optional: fill SEMANTIC_SCHOLAR_API_KEY
+cp .env.example .env        # default provider is OpenAlex; set OPENALEX_EMAIL for the polite pool
+                            # or CITATION_PROVIDER=semanticscholar + SEMANTIC_SCHOLAR_API_KEY
 mise install                # Go 1.25 + Node 22
 mise run dev                # docker compose: postgres + backend + frontend
 # open http://localhost:5173
@@ -128,7 +129,7 @@ exact TypeScript shapes.
 
 ### `GET /api/search?q=<query>&limit=<n>`
 
-Proxies Semantic Scholar's paper search. `limit` defaults to 10.
+Proxies the configured provider's paper search (OpenAlex `/works?search=` by default, or Semantic Scholar). `limit` defaults to 10.
 
 ```json
 {
@@ -145,7 +146,7 @@ Proxies Semantic Scholar's paper search. `limit` defaults to 10.
 
 Full metadata for one paper (title, authors, year, venue, abstract,
 DOI, external URLs, citation/reference counts). 404 if the paper is
-unknown to Semantic Scholar.
+unknown to the configured provider.
 
 ### `POST /api/graph/build`
 
@@ -221,7 +222,7 @@ required environment variables, and deploy commands.
 │   ├── api/server.go                  Vercel Go Function entry
 │   ├── internal/
 │   │   ├── api/                       chi router + handlers
-│   │   ├── citation/                  Semantic Scholar client
+│   │   ├── citation/                  OpenAlex primary + OpenCitations secondary (+ opt-in S2 tertiary)
 │   │   ├── graph/                     builder + similarity
 │   │   └── store/                     pgx + migrations + cache
 │   └── Dockerfile
