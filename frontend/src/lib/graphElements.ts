@@ -97,8 +97,8 @@ export function similarityEdgeStyle(
   const range = max - min;
   const raw = range > 0 ? (weight - min) / range : 0.5;
   const t = Math.min(1, Math.max(0, raw));
-  const lightness = 78 - t * 55;
-  const opacity = 0.3 + t * 0.6;
+  const lightness = 55 - t * 40;
+  const opacity = 0.55 + t * 0.4;
   const width = 1 + t * 3;
   return {
     color: `hsl(215, 18%, ${lightness.toFixed(0)}%)`,

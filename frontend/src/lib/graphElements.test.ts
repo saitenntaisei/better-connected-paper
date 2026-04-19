@@ -82,8 +82,8 @@ describe("similarityEdgeStyle", () => {
   it("clamps out-of-range weights", () => {
     const underflow = similarityEdgeStyle(-0.5, 0, 1);
     const overflow = similarityEdgeStyle(2, 0, 1);
-    expect(underflow.opacity).toBeCloseTo(0.3);
-    expect(overflow.opacity).toBeCloseTo(0.9);
+    expect(underflow.opacity).toBeCloseTo(0.55);
+    expect(overflow.opacity).toBeCloseTo(0.95);
   });
 });
 
