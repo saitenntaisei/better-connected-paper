@@ -46,7 +46,7 @@ describe("nodeSize", () => {
   it("is bounded and grows with citation count", () => {
     const small = nodeSize({ id: "a", title: "a", similarity: 0, citationCount: 0 });
     const big = nodeSize({ id: "b", title: "b", similarity: 0, citationCount: 100_000 });
-    expect(small).toBeGreaterThanOrEqual(18);
+    expect(small).toBeGreaterThanOrEqual(10);
     expect(big).toBeLessThanOrEqual(80);
     expect(big).toBeGreaterThan(small);
   });

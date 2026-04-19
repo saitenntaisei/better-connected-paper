@@ -51,4 +51,38 @@ export const graphStylesheet: StylesheetCSS[] = [
       opacity: 0.5,
     },
   },
+  {
+    selector: ".path-dim",
+    css: {
+      opacity: 0.15,
+      "text-opacity": 0.15,
+    },
+  },
+  {
+    selector: "node.path-hit",
+    css: {
+      opacity: 1,
+      "text-opacity": 1,
+      "border-width": 3,
+      "border-color": "#111827",
+      "border-opacity": 1,
+    },
+  },
+  {
+    selector: "node.seed.path-hit",
+    css: {
+      "border-width": 4,
+      "border-color": "#f59e0b",
+      "border-opacity": 1,
+    },
+  },
+  {
+    selector: "edge.path-hit",
+    css: {
+      opacity: 1,
+      width: 3,
+      "line-color": "#111827",
+      "target-arrow-color": "#111827",
+    },
+  },
 ];

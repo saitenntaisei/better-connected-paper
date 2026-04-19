@@ -72,22 +72,22 @@ function truncateLabel(title: string): string {
 
 export function nodeSize(n: GraphNode): number {
   const cc = n.citationCount ?? 0;
-  const base = 18 + Math.log10(cc + 1) * 10;
-  const clamped = Math.max(18, Math.min(80, base));
-  return n.isSeed ? clamped + 8 : clamped;
+  const base = 10 + Math.log10(cc + 1) * 11;
+  const clamped = Math.max(10, Math.min(80, base));
+  return n.isSeed ? clamped + 6 : clamped;
 }
 
 /**
- * Maps a publication year onto a blue→red gradient via HSL.
- * Older papers are cool-toned (blue), newer papers warm-toned (red).
+ * Maps a publication year onto a grayscale gradient.
+ * Older papers are lighter gray, newer papers are darker gray.
  */
 export function yearColor(year: number | undefined, minYear: number, maxYear: number): string {
   if (!year || year <= 0) return "#9ca3af";
-  if (maxYear === minYear) return "hsl(220, 70%, 55%)";
+  if (maxYear === minYear) return "hsl(0, 0%, 65%)";
   const t = Math.min(1, Math.max(0, (year - minYear) / (maxYear - minYear)));
-  // hue 220 (blue) -> 12 (red-orange)
-  const hue = 220 - t * 208;
-  return `hsl(${hue.toFixed(0)}, 70%, 55%)`;
+  // lightness 82% (old, light gray) -> 38% (new, dark gray)
+  const lightness = 82 - t * 44;
+  return `hsl(0, 0%, ${lightness.toFixed(0)}%)`;
 }
 
 function edgeId(e: GraphEdge): string {

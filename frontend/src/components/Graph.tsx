@@ -35,23 +35,56 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
       layout: {
         name: "cose-bilkent",
         animate: false,
-        idealEdgeLength: 120,
-        nodeRepulsion: 9000,
+        idealEdgeLength: 220,
+        nodeRepulsion: 22000,
         tile: true,
         fit: true,
-        padding: 30,
+        padding: 40,
       } as cytoscape.LayoutOptions,
       wheelSensitivity: 0.3,
     });
     cyRef.current = cy;
 
-    const handler = (evt: cytoscape.EventObject) => {
+    const tapHandler = (evt: cytoscape.EventObject) => {
       onSelectNode?.(evt.target.id());
     };
-    cy.on("tap", "node", handler);
+    cy.on("tap", "node", tapHandler);
+
+    const clearHighlight = () => {
+      cy.elements().removeClass("path-dim path-hit");
+    };
+    const hoverHandler = (evt: cytoscape.EventObject) => {
+      // BFS from the hovered node along citation edges only, so similarity
+      // links (which aren't part of the cite chain) don't bleed into the
+      // highlighted set.
+      const start: cytoscape.NodeSingular = evt.target;
+      const reachable = cy.collection();
+      reachable.merge(start);
+      const seen = new Set<string>([start.id()]);
+      const queue: cytoscape.NodeSingular[] = [start];
+      while (queue.length > 0) {
+        const n = queue.shift()!;
+        const outEdges = n.outgoers("edge.cite").edges();
+        reachable.merge(outEdges);
+        outEdges.forEach((edge) => {
+          const t = edge.target();
+          if (!seen.has(t.id())) {
+            seen.add(t.id());
+            reachable.merge(t);
+            queue.push(t);
+          }
+        });
+      }
+      cy.elements().addClass("path-dim");
+      reachable.removeClass("path-dim").addClass("path-hit");
+    };
+    cy.on("mouseover", "node", hoverHandler);
+    cy.on("mouseout", "node", clearHighlight);
 
     return () => {
-      cy.off("tap", "node", handler);
+      cy.off("tap", "node", tapHandler);
+      cy.off("mouseover", "node", hoverHandler);
+      cy.off("mouseout", "node", clearHighlight);
       cy.destroy();
       cyRef.current = null;
     };

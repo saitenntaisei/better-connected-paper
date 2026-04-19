@@ -13,10 +13,10 @@ import type { SearchResult } from "./types/api";
 export default function App() {
   const { state: searchState, runSearch } = useSearch({ limit: 10 });
   const { state: graphState, build } = useGraph();
-  const { seed: urlSeed, setSeed: setUrlSeed } = useUrlSeed();
+  const { seed: urlSeed, setSeed: setUrlSeed, hasPushedEntry } = useUrlSeed();
 
   const [focusId, setFocusId] = useState<string | null>(urlSeed);
-  const [showSimilarity, setShowSimilarity] = useState(false);
+  const [showSimilarity, setShowSimilarity] = useState(true);
 
   // Reset the detail-panel focus whenever the seed changes — including the
   // popstate case, which updates urlSeed without going through selectSeed.
@@ -53,6 +53,66 @@ export default function App() {
     return [Math.min(...years), Math.max(...years)];
   }, [graphState]);
 
+  if (urlSeed) {
+    return (
+      <main className="graph-page" aria-labelledby="graph-heading">
+        <div className="graph-page-header">
+          <button
+            type="button"
+            className="graph-back"
+            onClick={() => {
+              if (hasPushedEntry()) window.history.back();
+              else setUrlSeed(null);
+            }}
+            aria-label="Back to search"
+          >
+            ← Back
+          </button>
+          <h2 id="graph-heading" className="graph-page-title">
+            Citation graph
+            <span className="muted"> — {seedTitle}</span>
+          </h2>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showSimilarity}
+              onChange={(e) => setShowSimilarity(e.target.checked)}
+            />
+            Show similarity links
+          </label>
+        </div>
+        <div className="graph-page-body">
+          <div className="graph-main">
+            {graphState.status === "loading" && <Spinner label="Building graph" />}
+            {graphState.status === "error" && (
+              <div className="error-box" role="alert">
+                <p>{graphState.error}</p>
+                <button
+                  type="button"
+                  onClick={() => void build(urlSeed, true)}
+                  className="retry"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+            {graphState.status === "success" && (
+              <Graph
+                data={graphState.data}
+                onSelectNode={setFocusId}
+                showSimilarity={showSimilarity}
+              />
+            )}
+          </div>
+          <aside className="graph-side">
+            <Legend yearRange={yearRange} />
+            <PaperDetail id={focusId} />
+          </aside>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header>
@@ -62,7 +122,11 @@ export default function App() {
         </p>
       </header>
 
-      <SearchBar onSubmit={runSearch} busy={loading} />
+      <SearchBar
+        onSubmit={runSearch}
+        busy={loading}
+        initial={searchState.status === "idle" ? "" : searchState.query}
+      />
 
       {searchState.status === "error" && (
         <p className="error" role="alert">
@@ -86,53 +150,6 @@ export default function App() {
           />
         </section>
       )}
-
-      {urlSeed ? (
-        <section className="graph-section" aria-labelledby="graph-heading">
-          <div className="graph-header">
-            <h2 id="graph-heading" className="section-heading">
-              Citation graph
-              <span className="muted"> — seed: {seedTitle}</span>
-            </h2>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={showSimilarity}
-                onChange={(e) => setShowSimilarity(e.target.checked)}
-              />
-              Show similarity links
-            </label>
-          </div>
-          <div className="graph-layout">
-            <div className="graph-main">
-              {graphState.status === "loading" && <Spinner label="Building graph" />}
-              {graphState.status === "error" && (
-                <div className="error-box" role="alert">
-                  <p>{graphState.error}</p>
-                  <button
-                    type="button"
-                    onClick={() => void build(urlSeed, true)}
-                    className="retry"
-                  >
-                    Retry
-                  </button>
-                </div>
-              )}
-              {graphState.status === "success" && (
-                <Graph
-                  data={graphState.data}
-                  onSelectNode={setFocusId}
-                  showSimilarity={showSimilarity}
-                />
-              )}
-            </div>
-            <div className="graph-side">
-              <Legend yearRange={yearRange} />
-              <PaperDetail id={focusId} />
-            </div>
-          </div>
-        </section>
-      ) : null}
     </main>
   );
 }

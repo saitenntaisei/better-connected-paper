@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 const PARAM = "seed";
+const STATE_MARK = "bcp-seed";
 
 function readFromLocation(): string | null {
   if (typeof window === "undefined") return null;
@@ -10,9 +11,10 @@ function readFromLocation(): string | null {
 
 /**
  * Syncs a paper ID to the `?seed=` query string.
- * - Initial state reads from the URL so the graph rehydrates on refresh.
- * - setSeed() replaces history state (no new entry) to keep the back button useful.
- * - popstate listens to user navigation so back/forward reloads the right graph.
+ *
+ * Transitions between the search view (no seed) and the graph view (with seed)
+ * push a new history entry so browser Back navigates between them. Other
+ * updates replace the current entry to avoid flooding history.
  */
 export function useUrlSeed() {
   const [seed, setSeedState] = useState<string | null>(() => readFromLocation());
@@ -25,11 +27,24 @@ export function useUrlSeed() {
 
   const setSeed = useCallback((id: string | null) => {
     const url = new URL(window.location.href);
+    const previous = readFromLocation();
     if (id) url.searchParams.set(PARAM, id);
     else url.searchParams.delete(PARAM);
-    window.history.replaceState({}, "", url.toString());
+    // null → seed creates a new entry so browser Back returns to search.
+    // seed → null is only used as a direct-URL fallback (the "← Back" button
+    // prefers history.back() when it can), so replaceState keeps history clean.
+    if (id && previous === null) {
+      window.history.pushState({ kind: STATE_MARK }, "", url.toString());
+    } else {
+      window.history.replaceState(window.history.state, "", url.toString());
+    }
     setSeedState(id);
   }, []);
 
-  return { seed, setSeed };
+  const hasPushedEntry = useCallback(() => {
+    if (typeof window === "undefined") return false;
+    return window.history.state?.kind === STATE_MARK;
+  }, []);
+
+  return { seed, setSeed, hasPushedEntry };
 }
