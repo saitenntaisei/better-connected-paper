@@ -40,6 +40,41 @@ describe("toElements", () => {
     expect(edges).toHaveLength(1);
     expect(edges[0].classes).toBe("cite");
   });
+
+  it("drops nodes with no cite edges when includeSimilarity is false", () => {
+    const graph: GraphResponse = {
+      seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
+      nodes: [
+        { id: "S", title: "Seed", year: 2020, similarity: 0, isSeed: true, citationCount: 10 },
+        { id: "A", title: "Cites S", year: 2021, similarity: 0.6, citationCount: 5 },
+        { id: "B", title: "Only similar", year: 2022, similarity: 0.5, citationCount: 3 },
+      ],
+      edges: [
+        { source: "A", target: "S", kind: "cite", weight: 1 },
+        { source: "B", target: "S", kind: "similarity", weight: 0.4 },
+      ],
+      builtAt: "2026-04-19T00:00:00Z",
+    };
+    const { elements } = toElements(graph, { includeSimilarity: false });
+    const nodeIds = elements.filter((e) => e.group === "nodes").map((e) => e.data.id);
+    expect(nodeIds.sort()).toEqual(["A", "S"]);
+  });
+
+  it("keeps seed even when it has no cite edges under includeSimilarity false", () => {
+    const graph: GraphResponse = {
+      seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
+      nodes: [
+        { id: "S", title: "Seed", year: 2020, similarity: 0, isSeed: true, citationCount: 10 },
+        { id: "A", title: "A", year: 2021, similarity: 0.6, citationCount: 5 },
+        { id: "B", title: "B", year: 2022, similarity: 0.5, citationCount: 3 },
+      ],
+      edges: [{ source: "A", target: "B", kind: "cite", weight: 1 }],
+      builtAt: "2026-04-19T00:00:00Z",
+    };
+    const { elements } = toElements(graph, { includeSimilarity: false });
+    const nodeIds = elements.filter((e) => e.group === "nodes").map((e) => e.data.id);
+    expect(nodeIds.sort()).toEqual(["A", "B", "S"]);
+  });
 });
 
 describe("nodeSize", () => {

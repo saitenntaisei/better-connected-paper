@@ -26,8 +26,21 @@ export function toElements(
   const maxYear = years.length ? Math.max(...years) : 2020;
 
   const elements: ElementDefinition[] = [];
+  const includeSimilarity = opts.includeSimilarity ?? true;
+
+  const keepNode = (() => {
+    if (includeSimilarity) return () => true;
+    const citeEndpoints = new Set<string>();
+    for (const e of response.edges) {
+      if (e.kind !== "cite") continue;
+      citeEndpoints.add(e.source);
+      citeEndpoints.add(e.target);
+    }
+    return (n: GraphNode) => n.isSeed === true || citeEndpoints.has(n.id);
+  })();
 
   for (const n of response.nodes) {
+    if (!keepNode(n)) continue;
     elements.push({
       group: "nodes",
       data: {
@@ -46,7 +59,6 @@ export function toElements(
     });
   }
 
-  const includeSimilarity = opts.includeSimilarity ?? true;
   const simWeights = response.edges
     .filter((e) => e.kind === "similarity")
     .map((e) => e.weight ?? 0);
