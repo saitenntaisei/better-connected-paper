@@ -132,13 +132,6 @@ The interesting ones:
 - `backend/internal/store` — DB‑backed store tests, gated by `-tags=integration`; start `mise run dev` (or point `DATABASE_URL` at any Postgres) before running.
 - `frontend/src/lib/graphElements.test.ts` — the pure node/edge transform.
 
-## Roadmap
-
-- Playwright E2E covering the *search → graph → detail* happy path.
-- Multi‑seed graphs for side‑by‑side comparison of two papers.
-- Embedding‑based similarity as a third overlay.
-- Saveable collections for long reading sessions.
-
 ## License
 
 MIT — see [LICENSE](./LICENSE).
