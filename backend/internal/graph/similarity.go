@@ -1,17 +1,6 @@
 package graph
 
-import (
-	"math"
-	"slices"
-)
-
-// Default weights balance reference overlap, co-citation, and a bonus for
-// papers directly linked (cited by seed or citing seed).
-const (
-	WeightBiblioCoupling = 0.40
-	WeightCoCitation     = 0.40
-	WeightDirectLink     = 0.20
-)
+import "math"
 
 // JaccardLike returns the Salton (cosine) index of two id sets:
 //
@@ -44,22 +33,55 @@ func BibliographicCoupling(seedRefs, candRefs []string) float64 {
 	return JaccardLike(seedRefs, candRefs)
 }
 
-// CoCitation compares who cites each paper.
+// CoCitation compares who cites each paper — Salton over the two citer
+// id-sets. Used between fully-hydrated candidate pairs when building
+// similarity edges.
 func CoCitation(seedCitedBy, candCitedBy []string) float64 {
 	return JaccardLike(seedCitedBy, candCitedBy)
 }
 
-// DirectLink returns 1 if the candidate is in the seed's direct citation set.
-func DirectLink(seedRefs, seedCitedBy []string, candidateID string) float64 {
-	if slices.Contains(seedRefs, candidateID) || slices.Contains(seedCitedBy, candidateID) {
-		return 1
+// CoCitationApprox is the seed→candidate co-citation score used during
+// ranking. We can't afford to fetch every candidate's citer list (a famous
+// bridge paper has thousands of citers, and OpenAlex caps the list at 1000
+// anyway), so the numerator is reconstructed from data the Builder already
+// has: the seed's citers and their refs (the "refs" side of the first-hop
+// fetch). The count
+//
+//	|{P ∈ seedCiters : cand ∈ P.refs}|
+//
+// is the exact Salton numerator up to the seed.citers cap. The denominator
+// uses total citation counts from the provider, which are cache-invariant
+// and don't depend on whether P is a first-hop or 2-hop candidate — so the
+// same formula scores direct neighbors and bridge papers on one scale.
+func CoCitationApprox(
+	seedCiters []string,
+	seedCiterRefs map[string]map[string]struct{},
+	candID string,
+	seedCitationTotal, candCitationTotal int,
+) float64 {
+	if len(seedCiters) == 0 || seedCitationTotal <= 0 || candCitationTotal <= 0 {
+		return 0
 	}
-	return 0
+	count := 0
+	for _, pid := range seedCiters {
+		refs, ok := seedCiterRefs[pid]
+		if !ok {
+			continue
+		}
+		if _, has := refs[candID]; has {
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return float64(count) / math.Sqrt(float64(seedCitationTotal)*float64(candCitationTotal))
 }
 
-// Score combines the three metrics with default weights.
-func Score(biblio, coCite, direct float64) float64 {
-	return WeightBiblioCoupling*biblio +
-		WeightCoCitation*coCite +
-		WeightDirectLink*direct
+// ScoreCP is the Connected Papers-faithful similarity: mean of bibliographic
+// coupling and co-citation, both Salton-normalized. A 2-hop bridge cited by
+// many of the seed's citers (high coCite) beats a directly-cited paper that
+// shares no structure with the seed (biblio=0, coCite=0).
+func ScoreCP(biblio, coCite float64) float64 {
+	return (biblio + coCite) / 2
 }

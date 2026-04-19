@@ -45,9 +45,21 @@ type Builder struct {
 	// coupling signal for bridge papers. Default 2.
 	TwoHopSupport int
 
+	// MaxBridgeCandidates caps how many 2-hop papers we hydrate for scoring.
+	// A high-degree seed can produce thousands of 2-hop bridges, so we rank
+	// by support count and take the top N. Default 200.
+	MaxBridgeCandidates int
+
 	// SimilarityEdgeThreshold is the minimum pairwise similarity weight
 	// required to emit a similarity edge in the returned graph. Default 0.15.
 	SimilarityEdgeThreshold float64
+
+	// MaxFirstHop caps how many first-hop candidates we fetch. A seminal
+	// seed supplemented from Semantic Scholar can surface 1000+ citers, and
+	// the anonymous S2 rate limit (≈1 req / 3s) turns that into a multi-
+	// minute fetch that routinely rate-limits out. Ranking for a MaxNodes
+	// graph stays meaningful with a few hundred samples. Default 300.
+	MaxFirstHop int
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -63,10 +75,25 @@ var seedFields = []string{
 // minimalLinkFields is the cheap fetch used to explore the 1-hop cloud:
 // paper id plus the id lists we need for scoring. No title/abstract/etc.,
 // so the response size stays linear in |refs|+|cites| rather than quadratic.
+// citationCount is required by CoCitationApprox as the Salton denominator
+// scale for each candidate; without it the coCite term collapses to 0.
 var minimalLinkFields = []string{
 	"paperId",
+	"citationCount",
 	"references.paperId",
 	"citations.paperId",
+}
+
+// bridgeLinkFields is the refs-only fetch used for 2-hop bridge candidates.
+// Cites enrichment is deliberately skipped: most famous bridges have >100
+// citers, the OpenAlex client would then flag them CitationsUnknown, and
+// we'd have paid a per-paper fanout of cites requests for nothing. Refs are
+// returned inline in the /works response, so this batch stays ~O(|bridges|).
+// citationCount is required for coCite denominator; see minimalLinkFields.
+var bridgeLinkFields = []string{
+	"paperId",
+	"citationCount",
+	"references.paperId",
 }
 
 // fullNodeFields hydrates a selected node for the final response (title,
@@ -105,15 +132,43 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	seedRefs := seed.RefIDs()
 	seedCitedBy := seed.CitedByIDs()
 
-	firstHopIDs := dedupeExcluding(append(append([]string(nil), seedRefs...), seedCitedBy...), seed.PaperID)
+	// Seed may carry a secondary-provider alias when hybrid supplemented it
+	// (e.g. S2 hex when primary is OpenAlex). First-hop papers fetched from
+	// the secondary reference this alias; without canonicalization they
+	// materialize as a duplicate seed node with all the cite edges pointing
+	// there instead of the requested seed.
+	seedAlias := seed.MergedFromID
+	excluded := []string{seed.PaperID}
+	if seedAlias != "" {
+		excluded = append(excluded, seedAlias)
+	}
+	firstHopIDs := dedupeExcluding(append(append([]string(nil), seedRefs...), seedCitedBy...), excluded...)
+	if b.MaxFirstHop > 0 && len(firstHopIDs) > b.MaxFirstHop {
+		firstHopIDs = firstHopIDs[:b.MaxFirstHop]
+	}
 	firstHop, err := b.fetchWithCache(ctx, firstHopIDs, minimalLinkFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetch first hop: %w", err)
 	}
+	canonicalizeSeedAlias(firstHop, seedAlias, seed.PaperID)
 	firstHopByID := indexPapers(firstHop)
 
 	twoHopSupport := countTwoHopSupport(firstHop, seed.PaperID, firstHopByID)
-	scored := rankCandidates(seed, firstHop, twoHopSupport, b.TwoHopSupport)
+
+	// Bridge candidates: 2-hop papers with enough first-hop support to be
+	// worth hydrating. Capped to avoid a blow-out for high-degree seeds.
+	bridgeIDs := selectBridgeIDs(twoHopSupport, b.TwoHopSupport, b.MaxBridgeCandidates)
+	if seedAlias != "" {
+		bridgeIDs = filterOut(bridgeIDs, seedAlias)
+	}
+	bridges, err := b.fetchWithCache(ctx, bridgeIDs, bridgeLinkFields)
+	if err != nil {
+		return nil, fmt.Errorf("fetch two-hop bridges: %w", err)
+	}
+	canonicalizeSeedAlias(bridges, seedAlias, seed.PaperID)
+	bridgesByID := indexPapers(bridges)
+
+	scored := rankCandidates(seed, firstHop, bridges)
 	if len(scored) > b.MaxNodes-1 {
 		scored = scored[:b.MaxNodes-1]
 	}
@@ -128,6 +183,7 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
+	canonicalizeSeedAlias(full, seedAlias, seed.PaperID)
 	fullByID := indexPapers(full)
 	b.persistFetched(ctx, seed, full)
 
@@ -143,6 +199,8 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 			// Second-hop bridges only have minimal fields; fall back so the
 			// node still appears even without full metadata.
 			if mp, okm := firstHopByID[s.id]; okm {
+				p = mp
+			} else if mp, okm := bridgesByID[s.id]; okm {
 				p = mp
 			} else {
 				p = citation.Paper{PaperID: s.id}
@@ -162,6 +220,8 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 			linkSource[id] = p
 		} else if p, ok := firstHopByID[id]; ok {
 			linkSource[id] = p
+		} else if p, ok := bridgesByID[id]; ok {
+			linkSource[id] = p
 		}
 	}
 
@@ -170,12 +230,41 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	edges = append(edges, buildSimilarityEdges(selectedIDs, linkSource, b.SimilarityEdgeThreshold)...)
 	edges = dedupeEdges(edges)
 
+	nodes, edges = pruneOrphanNodes(seedNode.ID, nodes, edges)
+
 	return &Response{
 		Seed:    seedNode,
 		Nodes:   nodes,
 		Edges:   edges,
 		BuiltAt: now().UTC(),
 	}, nil
+}
+
+// pruneOrphanNodes drops non-seed nodes that participate in zero edges. Such
+// nodes score high enough on seed-only signals to make top-N but share no
+// structural overlap with any other selected node, so Cytoscape layouts stack
+// them at the origin and the visualization reads worse than a smaller but
+// fully-connected graph. The seed is preserved unconditionally.
+func pruneOrphanNodes(seedID string, nodes []Node, edges []Edge) ([]Node, []Edge) {
+	if len(nodes) == 0 {
+		return nodes, edges
+	}
+	endpoints := make(map[string]struct{}, len(edges)*2)
+	for _, e := range edges {
+		endpoints[e.Source] = struct{}{}
+		endpoints[e.Target] = struct{}{}
+	}
+	kept := nodes[:0]
+	for _, n := range nodes {
+		if n.ID == seedID {
+			kept = append(kept, n)
+			continue
+		}
+		if _, ok := endpoints[n.ID]; ok {
+			kept = append(kept, n)
+		}
+	}
+	return kept, edges
 }
 
 func (b *Builder) applyDefaults() {
@@ -188,8 +277,21 @@ func (b *Builder) applyDefaults() {
 	if b.TwoHopSupport <= 0 {
 		b.TwoHopSupport = 2
 	}
+	if b.MaxBridgeCandidates <= 0 {
+		b.MaxBridgeCandidates = 200
+	}
 	if b.SimilarityEdgeThreshold <= 0 {
-		b.SimilarityEdgeThreshold = 0.15
+		// OpenAlex returns referenced_works_count=0 for most arxiv preprints,
+		// which forces biblio=0 for whole subgraphs of modern ML/robotics
+		// research. With (biblio+coCite)/2 averaging, that halves every
+		// coCite-only pair and pushes legitimate bridges (e.g., pi_0 at
+		// ~0.095 co-cite with Octo) below the original 0.15 cutoff. Dropping
+		// to 0.08 restores the preprint cluster without opening the door to
+		// incidental overlaps.
+		b.SimilarityEdgeThreshold = 0.08
+	}
+	if b.MaxFirstHop <= 0 {
+		b.MaxFirstHop = 300
 	}
 }
 
@@ -283,6 +385,13 @@ func (b *Builder) persistFetched(ctx context.Context, seed *citation.Paper, full
 		if len(p.References) == 0 && len(p.Citations) == 0 {
 			continue
 		}
+		// The cache row is "complete" once links_fetched_at is stamped.
+		// Skip persist when the provider couldn't supply cites — otherwise
+		// a later GetPapersWithLinks read would hand the Builder an empty
+		// cites slice as if the paper had zero citers, corrupting scoring.
+		if p.CitationsUnknown {
+			continue
+		}
 		_ = b.Cache.ReplacePaperLinks(ctx, p.PaperID, p.RefIDs(), p.CitedByIDs())
 	}
 }
@@ -297,54 +406,64 @@ type scoredCandidate struct {
 	cc int
 }
 
-// rankCandidates assigns a score to every first-hop paper (biblio coupling +
-// co-citation + direct link to seed) and to every second-hop bridge (fraction
-// of first-hop papers that link to it, weighted). 2-hop candidates can't be
-// biblio-coupled against seed because we haven't fetched their refs; using
-// their connectivity to the first-hop cloud is the structural proxy.
+// rankCandidates scores every first-hop neighbor AND every hydrated 2-hop
+// bridge on the Connected Papers scale: mean of bibliographic coupling and
+// co-citation (Salton-normalized). The co-citation numerator is
+// reconstructed from first-hop papers' refs — `|{P ∈ seed.citers : cand ∈
+// P.refs}|` — so bridges and first-hop candidates are scored from the same
+// data and a 2-hop bridge cited by many of the seed's citers (the pi_0 /
+// Octo pattern) competes directly with weakly-coupled direct neighbors.
+//
+// Cached-cite fields on candidates are ignored by construction: only the
+// seed's citers drive the numerator, and the denominator uses the provider's
+// total CitationCount, which is stable across cache warm/cold runs.
 func rankCandidates(
 	seed *citation.Paper,
 	firstHop []citation.Paper,
-	twoHopSupport map[string]int,
-	minSupport int,
+	bridges []citation.Paper,
 ) []scoredCandidate {
 	seedRefs := seed.RefIDs()
-	seedCitedBy := seed.CitedByIDs()
+	seedCiters := seed.CitedByIDs()
 
-	scores := make(map[string]scoredCandidate, len(firstHop)+len(twoHopSupport))
-
+	// firstHopRefSets[P] is the set of ids P references. A subset of seedCiters
+	// overlaps firstHop (seeds we fetched via minimalLinkFields), so we get
+	// their refs here "for free" from the batch that was already paid for.
+	firstHopRefSets := make(map[string]map[string]struct{}, len(firstHop))
 	for _, p := range firstHop {
-		if p.PaperID == "" || p.PaperID == seed.PaperID {
+		refs := p.RefIDs()
+		if p.PaperID == "" || len(refs) == 0 {
 			continue
 		}
+		set := make(map[string]struct{}, len(refs))
+		for _, r := range refs {
+			set[r] = struct{}{}
+		}
+		firstHopRefSets[p.PaperID] = set
+	}
+
+	scores := make(map[string]scoredCandidate, len(firstHop)+len(bridges))
+
+	scoreOne := func(p citation.Paper) {
+		if p.PaperID == "" || p.PaperID == seed.PaperID {
+			return
+		}
+		if _, already := scores[p.PaperID]; already {
+			return
+		}
 		biblio := BibliographicCoupling(seedRefs, p.RefIDs())
-		coCite := CoCitation(seedCitedBy, p.CitedByIDs())
-		direct := DirectLink(seedRefs, seedCitedBy, p.PaperID)
+		coCite := CoCitationApprox(seedCiters, firstHopRefSets, p.PaperID, seed.CitationCount, p.CitationCount)
 		scores[p.PaperID] = scoredCandidate{
 			id:    p.PaperID,
-			score: Score(biblio, coCite, direct),
+			score: ScoreCP(biblio, coCite),
 			cc:    p.CitationCount,
 		}
 	}
 
-	if len(firstHop) > 0 {
-		for id, support := range twoHopSupport {
-			if support < minSupport {
-				continue
-			}
-			if _, already := scores[id]; already {
-				continue
-			}
-			if id == seed.PaperID {
-				continue
-			}
-			// Normalize to [0,1]: fully-supported = 1.0 (every first-hop
-			// paper bridges to this candidate). Multiplied by 0.5 so a
-			// 2-hop bridge with maximal support (1.0) scores 0.5 — below
-			// a well-coupled first-hop paper but above an unrelated one.
-			ratio := float64(support) / float64(len(firstHop))
-			scores[id] = scoredCandidate{id: id, score: 0.5 * ratio}
-		}
+	for _, p := range firstHop {
+		scoreOne(p)
+	}
+	for _, p := range bridges {
+		scoreOne(p)
 	}
 
 	out := make([]scoredCandidate, 0, len(scores))
@@ -358,6 +477,37 @@ func rankCandidates(
 		return out[i].score > out[j].score
 	})
 	return out
+}
+
+// selectBridgeIDs picks the top-`cap` 2-hop papers by support count, keeping
+// only those meeting minSupport. Sorting by support (desc) then ID (asc for
+// stability) makes the cut deterministic across runs for the same input.
+func selectBridgeIDs(support map[string]int, minSupport, cap int) []string {
+	type entry struct {
+		id      string
+		support int
+	}
+	candidates := make([]entry, 0, len(support))
+	for id, s := range support {
+		if s < minSupport {
+			continue
+		}
+		candidates = append(candidates, entry{id: id, support: s})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].support != candidates[j].support {
+			return candidates[i].support > candidates[j].support
+		}
+		return candidates[i].id < candidates[j].id
+	})
+	if cap > 0 && len(candidates) > cap {
+		candidates = candidates[:cap]
+	}
+	ids := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		ids = append(ids, c.id)
+	}
+	return ids
 }
 
 // countTwoHopSupport counts, for every paper id reached by either a reference
@@ -463,11 +613,20 @@ func sliceSet(ids []string) map[string]struct{} {
 	return out
 }
 
-func dedupeExcluding(ids []string, exclude string) []string {
+func dedupeExcluding(ids []string, exclude ...string) []string {
+	excl := make(map[string]struct{}, len(exclude))
+	for _, e := range exclude {
+		if e != "" {
+			excl[e] = struct{}{}
+		}
+	}
 	seen := make(map[string]struct{}, len(ids))
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if id == "" || id == exclude {
+		if id == "" {
+			continue
+		}
+		if _, skip := excl[id]; skip {
 			continue
 		}
 		if _, ok := seen[id]; ok {
@@ -477,6 +636,43 @@ func dedupeExcluding(ids []string, exclude string) []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+func filterOut(ids []string, drop string) []string {
+	if drop == "" {
+		return ids
+	}
+	out := ids[:0]
+	for _, id := range ids {
+		if id != drop {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// canonicalizeSeedAlias rewrites every occurrence of the seed's secondary
+// paperId (e.g. Semantic Scholar hex when the primary provider is OpenAlex)
+// to the canonical primary paperId inside the papers' refs/cites lists.
+// This collapses cross-provider references so the seed node in the final
+// graph absorbs cite edges coming from papers that were fetched from the
+// secondary provider.
+func canonicalizeSeedAlias(papers []citation.Paper, aliasID, canonicalID string) {
+	if aliasID == "" || canonicalID == "" || aliasID == canonicalID {
+		return
+	}
+	for i := range papers {
+		for j := range papers[i].References {
+			if papers[i].References[j].PaperID == aliasID {
+				papers[i].References[j].PaperID = canonicalID
+			}
+		}
+		for j := range papers[i].Citations {
+			if papers[i].Citations[j].PaperID == aliasID {
+				papers[i].Citations[j].PaperID = canonicalID
+			}
+		}
+	}
 }
 
 func chunkStrings(in []string, size int) [][]string {

@@ -35,27 +35,53 @@ func TestJaccardLikeIdentical(t *testing.T) {
 	}
 }
 
-func TestDirectLink(t *testing.T) {
-	refs := []string{"a", "b"}
-	cites := []string{"c"}
-	if v := DirectLink(refs, cites, "a"); v != 1 {
-		t.Errorf("want 1 for ref member, got %v", v)
+func TestCoCitationApproxCountsSeedCitersWithCandInRefs(t *testing.T) {
+	seedCiters := []string{"P1", "P2", "P3"}
+	// P1 and P3 cite candidate "C"; P2 does not.
+	citerRefs := map[string]map[string]struct{}{
+		"P1": {"C": {}, "X": {}},
+		"P2": {"X": {}},
+		"P3": {"C": {}, "Y": {}},
 	}
-	if v := DirectLink(refs, cites, "c"); v != 1 {
-		t.Errorf("want 1 for cite member, got %v", v)
-	}
-	if v := DirectLink(refs, cites, "z"); v != 0 {
-		t.Errorf("want 0 for unrelated, got %v", v)
+	got := CoCitationApprox(seedCiters, citerRefs, "C", 3, 4)
+	want := 2.0 / math.Sqrt(3.0*4.0)
+	if !almostEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
-func TestScoreIsWeightedSum(t *testing.T) {
-	got := Score(1, 1, 1)
-	want := WeightBiblioCoupling + WeightCoCitation + WeightDirectLink
-	if !almostEqual(got, want) {
-		t.Errorf("got %v want %v", got, want)
+func TestCoCitationApproxZeroGuards(t *testing.T) {
+	refs := map[string]map[string]struct{}{"P1": {"C": {}}}
+	cases := []struct {
+		name                       string
+		citers                     []string
+		seedTotal, candTotal       int
+		refsMap                    map[string]map[string]struct{}
+		candID                     string
+		wantZeroReason             string
+	}{
+		{"no citers", nil, 10, 10, refs, "C", "empty seed citers"},
+		{"zero seed total", []string{"P1"}, 0, 10, refs, "C", "seed.CitationCount unknown"},
+		{"zero cand total", []string{"P1"}, 10, 0, refs, "C", "cand.CitationCount unknown"},
+		{"no overlap", []string{"P1"}, 10, 10, refs, "Z", "no citer refs cand"},
 	}
-	if !almostEqual(want, 1.0) {
-		t.Errorf("weights should sum to 1, got %v", want)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if v := CoCitationApprox(c.citers, c.refsMap, c.candID, c.seedTotal, c.candTotal); v != 0 {
+				t.Errorf("%s: got %v, want 0", c.wantZeroReason, v)
+			}
+		})
+	}
+}
+
+func TestScoreCPIsMean(t *testing.T) {
+	if v := ScoreCP(0.4, 0.2); !almostEqual(v, 0.3) {
+		t.Errorf("got %v, want 0.3", v)
+	}
+	if v := ScoreCP(0, 0); v != 0 {
+		t.Errorf("zero inputs should score 0, got %v", v)
+	}
+	if v := ScoreCP(1, 1); !almostEqual(v, 1.0) {
+		t.Errorf("unit inputs should score 1, got %v", v)
 	}
 }
