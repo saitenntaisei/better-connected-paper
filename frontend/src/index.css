@@ -82,10 +82,10 @@ button {
 }
 
 .masthead {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-items: baseline;
-  gap: 1.25rem 2.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1.25rem;
   padding-bottom: 1.75rem;
   border-bottom: 1px solid var(--rule-strong);
   margin-bottom: 3.5rem;
@@ -97,7 +97,6 @@ button {
   letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--muted);
-  grid-column: 1 / -1;
   display: flex;
   gap: 1.5rem;
   flex-wrap: wrap;
@@ -134,12 +133,11 @@ button {
 }
 
 .tagline {
-  grid-column: 2;
   max-width: 56ch;
   font-size: 1.05rem;
   line-height: 1.5;
   color: var(--ink-soft);
-  margin: 1.25rem 0 0;
+  margin: 0;
 }
 
 .tagline .caps {
