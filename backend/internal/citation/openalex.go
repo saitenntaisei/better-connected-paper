@@ -381,16 +381,16 @@ func (c *OpenAlexClient) do(ctx context.Context, method, path string, body io.Re
 // --- JSON shapes ---
 
 type openAlexWork struct {
-	ID                    string                 `json:"id"`
-	DisplayName           string                 `json:"display_name"`
-	PublicationYear       int                    `json:"publication_year"`
-	CitedByCount          int                    `json:"cited_by_count"`
-	ReferencedWorksCount  int                    `json:"referenced_works_count"`
-	ReferencedWorks       []string               `json:"referenced_works"`
-	AbstractInvertedIndex map[string][]int       `json:"abstract_inverted_index"`
-	PrimaryLocation       *openAlexLocation      `json:"primary_location"`
-	Authorships           []openAlexAuthorship   `json:"authorships"`
-	Ids                   openAlexIds            `json:"ids"`
+	ID                    string               `json:"id"`
+	DisplayName           string               `json:"display_name"`
+	PublicationYear       int                  `json:"publication_year"`
+	CitedByCount          int                  `json:"cited_by_count"`
+	ReferencedWorksCount  int                  `json:"referenced_works_count"`
+	ReferencedWorks       []string             `json:"referenced_works"`
+	AbstractInvertedIndex map[string][]int     `json:"abstract_inverted_index"`
+	PrimaryLocation       *openAlexLocation    `json:"primary_location"`
+	Authorships           []openAlexAuthorship `json:"authorships"`
+	Ids                   openAlexIds          `json:"ids"`
 }
 
 type openAlexLocation struct {

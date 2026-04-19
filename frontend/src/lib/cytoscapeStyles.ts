@@ -1,4 +1,4 @@
-import type { StylesheetCSS } from "cytoscape";
+import type { EdgeSingular, StylesheetCSS } from "cytoscape";
 
 export const graphStylesheet: StylesheetCSS[] = [
   {
@@ -51,7 +51,7 @@ export const graphStylesheet: StylesheetCSS[] = [
       "line-color": "data(color)",
       "line-style": "dashed",
       "curve-style": "bezier",
-      opacity: "data(opacity)",
+      opacity: (ele: EdgeSingular) => ele.data("opacity") as number,
     },
   },
   {

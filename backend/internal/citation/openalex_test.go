@@ -438,14 +438,14 @@ func TestReconstructAbstract(t *testing.T) {
 
 func TestNormalizeOpenAlexID(t *testing.T) {
 	cases := map[string]string{
-		"W123":                           "W123",
-		"https://openalex.org/W123":      "W123",
-		"10.1234/abc":                    "doi:10.1234/abc",
-		"https://doi.org/10.1234/abc":    "doi:10.1234/abc",
-		"doi:10.1234/abc":                "doi:10.1234/abc",
-		"pmid:99":                        "pmid:99",
-		"":                               "",
-		"  W7  ":                         "W7",
+		"W123":                        "W123",
+		"https://openalex.org/W123":   "W123",
+		"10.1234/abc":                 "doi:10.1234/abc",
+		"https://doi.org/10.1234/abc": "doi:10.1234/abc",
+		"doi:10.1234/abc":             "doi:10.1234/abc",
+		"pmid:99":                     "pmid:99",
+		"":                            "",
+		"  W7  ":                      "W7",
 	}
 	for in, want := range cases {
 		if got := normalizeOpenAlexID(in); got != want {
