@@ -158,11 +158,11 @@ func TestHybridDoesNotShrinkPrimaryCites(t *testing.T) {
 			cites[i] = Paper{PaperID: "W_citer_" + string(rune('A'+i%26))}
 		}
 		return &Paper{
-			PaperID:        "W1",
-			ReferenceCount: 99,            // triggers refsGap
-			Citations:      cites,         // primary already has 60 cites
+			PaperID:          "W1",
+			ReferenceCount:   99,    // triggers refsGap
+			Citations:        cites, // primary already has 60 cites
 			CitationsUnknown: false,
-			ExternalIDs:    ExternalIDs{"DOI": "10.1/x"},
+			ExternalIDs:      ExternalIDs{"DOI": "10.1/x"},
 		}, nil
 	}}
 	secondary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
@@ -301,7 +301,7 @@ func TestHybridBatchNoSecondaryWhenConfigured(t *testing.T) {
 
 func TestIsSecondaryID(t *testing.T) {
 	cases := map[string]bool{
-		"W4402353985":                              false,
+		"W4402353985": false,
 		"0123456789abcdef0123456789abcdef01234567": true,
 		"0123456789ABCDEF0123456789abcdef01234567": true,
 		"10.48550/arXiv.2405.12213":                false,
@@ -572,9 +572,9 @@ func TestResolvingTertiaryTranslatesRefs(t *testing.T) {
 			Title:   "Octo",
 			References: []Paper{
 				{PaperID: "hex_a", ExternalIDs: ExternalIDs{"DOI": "10.1/a"}},
-				{PaperID: "hex_b", ExternalIDs: ExternalIDs{"DOI": "10.1/B"}},    // uppercase -> normalized lower
-				{PaperID: "hex_c", ExternalIDs: ExternalIDs{"DOI": "10.1/a"}},    // dupe -> deduped
-				{PaperID: "hex_d"},                                               // no DOI -> dropped
+				{PaperID: "hex_b", ExternalIDs: ExternalIDs{"DOI": "10.1/B"}}, // uppercase -> normalized lower
+				{PaperID: "hex_c", ExternalIDs: ExternalIDs{"DOI": "10.1/a"}}, // dupe -> deduped
+				{PaperID: "hex_d"}, // no DOI -> dropped
 			},
 			Citations: []Paper{
 				{PaperID: "hex_e", ExternalIDs: ExternalIDs{"DOI": "10.2/e"}},
@@ -670,7 +670,7 @@ func TestResolvingTertiarySupplementsCitersWhenInlineHits1000(t *testing.T) {
 		}},
 		citersFrom: func(ctx context.Context, id string, offset, limit int, fields []string) ([]Paper, error) {
 			return []Paper{
-				{PaperID: "x5", ExternalIDs: ExternalIDs{"DOI": "10.x/5"}},          // dup of inline
+				{PaperID: "x5", ExternalIDs: ExternalIDs{"DOI": "10.x/5"}}, // dup of inline
 				{PaperID: "newA", ExternalIDs: ExternalIDs{"DOI": "10.new/a"}},
 				{PaperID: "newB", ExternalIDs: ExternalIDs{"DOI": "10.new/b"}},
 			}, nil

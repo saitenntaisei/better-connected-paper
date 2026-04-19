@@ -53,12 +53,12 @@ func TestCoCitationApproxCountsSeedCitersWithCandInRefs(t *testing.T) {
 func TestCoCitationApproxZeroGuards(t *testing.T) {
 	refs := map[string]map[string]struct{}{"P1": {"C": {}}}
 	cases := []struct {
-		name                       string
-		citers                     []string
-		seedTotal, candTotal       int
-		refsMap                    map[string]map[string]struct{}
-		candID                     string
-		wantZeroReason             string
+		name                 string
+		citers               []string
+		seedTotal, candTotal int
+		refsMap              map[string]map[string]struct{}
+		candID               string
+		wantZeroReason       string
 	}{
 		{"no citers", nil, 10, 10, refs, "C", "empty seed citers"},
 		{"zero seed total", []string{"P1"}, 0, 10, refs, "C", "seed.CitationCount unknown"},
