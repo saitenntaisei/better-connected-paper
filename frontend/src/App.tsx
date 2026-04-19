@@ -129,9 +129,6 @@ export default function App() {
           <span>Vol. I · Issue 04</span>
           <span>MMXXVI</span>
         </div>
-        <div className="masthead-numeral" aria-hidden="true">
-          №1
-        </div>
         <h1 className="masthead-title">
           Better <em>Connected</em> Paper
         </h1>

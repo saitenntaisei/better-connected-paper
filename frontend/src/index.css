@@ -116,17 +116,6 @@ button {
   content: none;
 }
 
-.masthead-numeral {
-  font-family: var(--font-display);
-  font-size: clamp(3.2rem, 7vw, 5.5rem);
-  font-weight: 300;
-  font-style: italic;
-  font-variation-settings: "opsz" 144, "SOFT" 100;
-  line-height: 0.85;
-  color: var(--accent);
-  letter-spacing: -0.03em;
-}
-
 .masthead-title {
   font-family: var(--font-display);
   font-weight: 400;
