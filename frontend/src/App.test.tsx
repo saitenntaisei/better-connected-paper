@@ -67,7 +67,9 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: /search/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/Attention Is All You Need/)).toBeInTheDocument();
+      expect(
+        screen.getByRole("option", { name: /Attention Is All You Need/ }),
+      ).toBeInTheDocument();
     });
     await user.click(screen.getByRole("option", { name: /Attention Is All You Need/ }));
 
