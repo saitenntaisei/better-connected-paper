@@ -10,14 +10,14 @@ export function PaperDetail({ id }: Props) {
 
   if (!id || state.status === "idle") {
     return (
-      <aside className="detail placeholder" aria-live="polite">
+      <aside className="detail placeholder" aria-live="polite" data-caption="Paper">
         <p className="muted">Click a node to see paper details.</p>
       </aside>
     );
   }
   if (state.status === "loading") {
     return (
-      <aside className="detail" aria-live="polite">
+      <aside className="detail" aria-live="polite" data-caption="Paper">
         <p className="muted" role="status">
           Loading paper…
         </p>
@@ -26,7 +26,7 @@ export function PaperDetail({ id }: Props) {
   }
   if (state.status === "error") {
     return (
-      <aside className="detail" aria-live="polite">
+      <aside className="detail" aria-live="polite" data-caption="Paper">
         <p className="error" role="alert">
           {state.error}
         </p>
@@ -39,9 +39,9 @@ export function PaperDetail({ id }: Props) {
 
 function PaperCard({ paper }: { paper: Paper }) {
   return (
-    <aside className="detail" aria-live="polite">
+    <aside className="detail" aria-live="polite" data-caption="Paper">
       <h3 className="detail-title">{paper.title}</h3>
-      <p className="detail-meta">
+      <p className="detail-meta tabular">
         {paper.year ? <span>{paper.year}</span> : null}
         {paper.venue ? <span>{paper.venue}</span> : null}
         {typeof paper.citationCount === "number" ? (
@@ -70,7 +70,7 @@ function ExternalLinks({ paper }: { paper: Paper }) {
   const doi = paper.externalIds?.DOI;
   const arxiv = paper.externalIds?.ArXiv;
   const links: { href: string; label: string }[] = [];
-  if (paper.url) links.push({ href: paper.url, label: "Semantic Scholar" });
+  if (paper.url) links.push({ href: paper.url, label: "Source" });
   if (doi) links.push({ href: `https://doi.org/${doi}`, label: "DOI" });
   if (arxiv) links.push({ href: `https://arxiv.org/abs/${arxiv}`, label: "arXiv" });
   if (links.length === 0) return null;

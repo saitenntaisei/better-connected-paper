@@ -69,8 +69,8 @@ export default function App() {
             ← Back
           </button>
           <h2 id="graph-heading" className="graph-page-title">
-            Citation graph
-            <span className="muted"> — {seedTitle}</span>
+            <span className="eyebrow">Citation graph ·</span>
+            <span className="seed-title">{seedTitle}</span>
           </h2>
           <label className="toggle">
             <input
@@ -113,20 +113,52 @@ export default function App() {
     );
   }
 
+  const currentQuery = searchState.status === "idle" ? "" : searchState.query;
+  const suggestions = [
+    "Attention Is All You Need",
+    "Neural radiance fields",
+    "Octo generalist robot policy",
+    "ImageNet classification",
+  ];
+
   return (
     <main className="app-shell">
-      <header>
-        <h1>Better Connected Paper</h1>
+      <header className="masthead">
+        <div className="masthead-meta">
+          <span>Citation Explorer</span>
+          <span>Vol. I · Issue 04</span>
+          <span>MMXXVI</span>
+        </div>
+        <div className="masthead-numeral" aria-hidden="true">
+          №1
+        </div>
+        <h1 className="masthead-title">
+          Better <em>Connected</em> Paper
+        </h1>
         <p className="tagline">
-          Citation-aware paper explorer — the directed graph Connected Papers doesn&apos;t show.
+          <span className="caps">A directed graph reader</span>
+          Trace references and neighbors of any paper — the citation edges Connected
+          Papers quietly omits, laid out for close reading.
         </p>
       </header>
 
-      <SearchBar
-        onSubmit={runSearch}
-        busy={loading}
-        initial={searchState.status === "idle" ? "" : searchState.query}
-      />
+      <div className="search-block">
+        <SearchBar onSubmit={runSearch} busy={loading} initial={currentQuery} />
+        <div className="suggestions">
+          <span className="suggestions-label">Start with</span>
+          {suggestions.map((q) => (
+            <button
+              key={q}
+              type="button"
+              className="suggestion-chip"
+              onClick={() => runSearch(q)}
+              disabled={loading}
+            >
+              {q}
+            </button>
+          ))}
+        </div>
+      </div>
 
       {searchState.status === "error" && (
         <p className="error" role="alert">
@@ -139,7 +171,7 @@ export default function App() {
           <h2 id="results-heading" className="section-heading">
             Results
             {searchState.status === "success" ? (
-              <span className="muted"> ({searchState.data.total.toLocaleString()} found)</span>
+              <span className="muted">{searchState.data.total.toLocaleString()} found</span>
             ) : null}
             {loading ? <Spinner label="Searching" /> : null}
           </h2>
@@ -150,6 +182,12 @@ export default function App() {
           />
         </section>
       )}
+
+      <footer className="colophon">
+        <span>Better Connected Paper</span>
+        <span>OpenAlex · OpenCitations</span>
+        <span>Crafted 2026</span>
+      </footer>
     </main>
   );
 }

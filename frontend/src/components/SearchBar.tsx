@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type Props = {
   onSubmit: (query: string) => void;
@@ -9,6 +9,9 @@ type Props = {
 
 export function SearchBar({ onSubmit, initial = "", busy = false, placeholder }: Props) {
   const [value, setValue] = useState(initial);
+  useEffect(() => {
+    setValue(initial);
+  }, [initial]);
   const trimmed = value.trim();
 
   return (
@@ -25,7 +28,7 @@ export function SearchBar({ onSubmit, initial = "", busy = false, placeholder }:
         aria-label="Paper search"
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        placeholder={placeholder ?? "Title, DOI, or arXiv ID"}
+        placeholder={placeholder ?? "e.g. Attention Is All You Need"}
         autoFocus
       />
       <button type="submit" disabled={!trimmed || busy}>

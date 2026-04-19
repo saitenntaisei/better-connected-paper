@@ -5,8 +5,8 @@ type Props = {
 export function Legend({ yearRange }: Props) {
   const [minYear, maxYear] = yearRange ?? [2000, 2020];
   return (
-    <aside className="legend" aria-label="Graph legend">
-      <h3 className="legend-title">Legend</h3>
+    <aside className="legend" aria-label="Graph legend" data-caption="Legend">
+      <h3 className="legend-title">How to read this graph</h3>
       <div className="legend-row">
         <span className="swatch seed" aria-hidden="true" />
         <span>Seed paper</span>

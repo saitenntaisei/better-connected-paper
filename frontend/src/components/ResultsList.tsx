@@ -16,7 +16,7 @@ export function ResultsList({ results, selectedId, onSelect }: Props) {
   }
   return (
     <ul className="results-list" role="listbox" aria-label="Search results">
-      {results.map((r) => {
+      {results.map((r, i) => {
         const selected = r.id === selectedId;
         return (
           <li key={r.id}>
@@ -26,9 +26,10 @@ export function ResultsList({ results, selectedId, onSelect }: Props) {
               role="option"
               aria-selected={selected}
               onClick={() => onSelect(r)}
+              data-index={String(i + 1).padStart(2, "0")}
             >
               <span className="result-title">{r.title || "(untitled)"}</span>
-              <span className="result-meta">
+              <span className="result-meta tabular">
                 {r.year ? <span>{r.year}</span> : null}
                 {r.venue ? <span>{r.venue}</span> : null}
                 {typeof r.citationCount === "number" ? (
