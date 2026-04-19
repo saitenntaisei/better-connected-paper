@@ -54,9 +54,6 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
       cy.elements().removeClass("path-dim path-hit");
     };
     const hoverHandler = (evt: cytoscape.EventObject) => {
-      // BFS from the hovered node along citation edges only, so similarity
-      // links (which aren't part of the cite chain) don't bleed into the
-      // highlighted set.
       const start: cytoscape.NodeSingular = evt.target;
       const reachable = cy.collection();
       reachable.merge(start);
@@ -75,6 +72,12 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
           }
         });
       }
+      const simEdges = start.connectedEdges("edge.similarity");
+      reachable.merge(simEdges);
+      simEdges.forEach((edge) => {
+        reachable.merge(edge.source());
+        reachable.merge(edge.target());
+      });
       cy.elements().addClass("path-dim");
       reachable.removeClass("path-dim").addClass("path-hit");
     };

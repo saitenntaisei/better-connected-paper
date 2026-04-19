@@ -45,10 +45,10 @@ export const graphStylesheet: StylesheetCSS[] = [
     selector: "edge.similarity",
     css: {
       width: "mapData(weight, 0, 1, 1, 4)",
-      "line-color": "#9ca3af",
+      "line-color": "mapData(weight, 0, 1, #e5e7eb, #1f2937)",
       "line-style": "dashed",
       "curve-style": "bezier",
-      opacity: 0.5,
+      opacity: "mapData(weight, 0, 1, 0.35, 0.85)",
     },
   },
   {

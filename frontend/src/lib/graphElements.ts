@@ -70,9 +70,11 @@ function truncateLabel(title: string): string {
   return title.slice(0, 57) + "…";
 }
 
+const CITATION_CAP = 10000;
+
 export function nodeSize(n: GraphNode): number {
-  const cc = n.citationCount ?? 0;
-  const base = 10 + Math.log10(cc + 1) * 11;
+  const cc = Math.min(n.citationCount ?? 0, CITATION_CAP);
+  const base = 10 + Math.log10(cc + 1) * 17.5;
   const clamped = Math.max(10, Math.min(80, base));
   return n.isSeed ? clamped + 6 : clamped;
 }
