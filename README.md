@@ -68,19 +68,22 @@ available as an opt‑in tertiary) for *S*'s metadata, references, and citations
 That pool — everything one hop away from *S* — is then re‑fetched in batches to
 pick up each candidate's own references.
 
-Every candidate *p* gets scored by a weighted sum of three classical signals:
+Every candidate *p* gets scored with the Connected Papers–faithful
+formulation: the mean of two Salton (cosine) indices — bibliographic coupling
+over what they both cite, and co‑citation over who cites them both.
 
 ```
-sim(S, p) = 0.4 · bibliographic_coupling(S, p)
-          + 0.4 · co_citation(S, p)
-          + 0.2 · direct_link(S, p)
+sim(S, p) = ½ · |refs(S) ∩ refs(p)|  / √(|refs(S)|·|refs(p)|)
+          + ½ · |citers(S) ∩ citers(p)| / √(|citers(S)|·|citers(p)|)
 ```
 
-The top ~40 become nodes (the seed always survives). For any pair *(a, b)* in
-that set, if *a* cites *b* we draw an arrow *a → b*. Similarity edges are
-computed separately and toggled client‑side, so the citation layer stays
-readable by default. The whole graph is persisted as a JSON blob keyed by
-seed ID with a 30‑day TTL.
+A 2‑hop bridge that shares many citers with the seed can therefore out‑rank a
+directly‑cited paper that shares no structural context. The top ~40 candidates
+become nodes (the seed always survives); for any pair *(a, b)* in that set, if
+*a* cites *b* we draw an arrow *a → b*. Similarity edges are computed
+separately and toggled client‑side, so the citation layer stays readable by
+default. The whole graph is persisted as a JSON blob keyed by seed ID with a
+30‑day TTL.
 
 The frontend renders all of this with [Cytoscape.js](https://js.cytoscape.org/)
 and the cose‑bilkent layout, with a small pure transform in
