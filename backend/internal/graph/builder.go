@@ -471,10 +471,13 @@ func rankCandidates(
 		out = append(out, s)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].score == out[j].score {
+		if out[i].score != out[j].score {
+			return out[i].score > out[j].score
+		}
+		if out[i].cc != out[j].cc {
 			return out[i].cc > out[j].cc
 		}
-		return out[i].score > out[j].score
+		return out[i].id < out[j].id
 	})
 	return out
 }
