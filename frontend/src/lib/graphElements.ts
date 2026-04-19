@@ -47,19 +47,29 @@ export function toElements(
   }
 
   const includeSimilarity = opts.includeSimilarity ?? true;
+  const simWeights = response.edges
+    .filter((e) => e.kind === "similarity")
+    .map((e) => e.weight ?? 0);
+  const simMin = simWeights.length ? Math.min(...simWeights) : 0;
+  const simMax = simWeights.length ? Math.max(...simWeights) : 1;
+
   for (const e of response.edges) {
     if (e.kind === "similarity" && !includeSimilarity) continue;
-    elements.push({
-      group: "edges",
-      data: {
-        id: edgeId(e),
-        source: e.source,
-        target: e.target,
-        kind: e.kind,
-        weight: e.weight ?? 1,
-      },
-      classes: e.kind,
-    });
+    const weight = e.weight ?? 1;
+    const data: Record<string, unknown> = {
+      id: edgeId(e),
+      source: e.source,
+      target: e.target,
+      kind: e.kind,
+      weight,
+    };
+    if (e.kind === "similarity") {
+      const style = similarityEdgeStyle(weight, simMin, simMax);
+      data.color = style.color;
+      data.opacity = style.opacity;
+      data.lineWidth = style.width;
+    }
+    elements.push({ group: "edges", data, classes: e.kind });
   }
 
   return { elements, yearRange: [minYear, maxYear] };
@@ -74,9 +84,27 @@ const CITATION_CAP = 10000;
 
 export function nodeSize(n: GraphNode): number {
   const cc = Math.min(n.citationCount ?? 0, CITATION_CAP);
-  const base = 10 + Math.log10(cc + 1) * 17.5;
+  const base = 6 + Math.log2(cc + 1) * 5.5;
   const clamped = Math.max(10, Math.min(80, base));
   return n.isSeed ? clamped + 6 : clamped;
+}
+
+export function similarityEdgeStyle(
+  weight: number,
+  min: number,
+  max: number,
+): { color: string; opacity: number; width: number } {
+  const range = max - min;
+  const raw = range > 0 ? (weight - min) / range : 0.5;
+  const t = Math.min(1, Math.max(0, raw));
+  const lightness = 78 - t * 55;
+  const opacity = 0.3 + t * 0.6;
+  const width = 1 + t * 3;
+  return {
+    color: `hsl(215, 18%, ${lightness.toFixed(0)}%)`,
+    opacity,
+    width,
+  };
 }
 
 /**

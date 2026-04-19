@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nodeSize, toElements, yearColor } from "./graphElements";
+import { nodeSize, similarityEdgeStyle, toElements, yearColor } from "./graphElements";
 import type { GraphResponse } from "../types/api";
 
 const sample: GraphResponse = {
@@ -51,10 +51,39 @@ describe("nodeSize", () => {
     expect(big).toBeGreaterThan(small);
   });
 
+  it("spreads visibly across the 0-100 citation range", () => {
+    const zero = nodeSize({ id: "a", title: "a", similarity: 0, citationCount: 0 });
+    const hundred = nodeSize({ id: "b", title: "b", similarity: 0, citationCount: 100 });
+    expect(hundred - zero).toBeGreaterThan(30);
+  });
+
+  it("treats 10k+ citations as the biggest circle", () => {
+    const tenK = nodeSize({ id: "a", title: "a", similarity: 0, citationCount: 10_000 });
+    const hundredK = nodeSize({ id: "b", title: "b", similarity: 0, citationCount: 100_000 });
+    expect(hundredK).toBe(tenK);
+  });
+
   it("adds a premium to the seed node", () => {
     const regular = nodeSize({ id: "a", title: "a", similarity: 0, citationCount: 100 });
     const seed = nodeSize({ id: "a", title: "a", similarity: 0, citationCount: 100, isSeed: true });
     expect(seed).toBeGreaterThan(regular);
+  });
+});
+
+describe("similarityEdgeStyle", () => {
+  it("stretches a narrow weight range across the visible gradient", () => {
+    const low = similarityEdgeStyle(0.08, 0.08, 0.27);
+    const high = similarityEdgeStyle(0.27, 0.08, 0.27);
+    expect(low.opacity).toBeLessThan(high.opacity);
+    expect(low.width).toBeLessThan(high.width);
+    expect(low.color).not.toEqual(high.color);
+  });
+
+  it("clamps out-of-range weights", () => {
+    const underflow = similarityEdgeStyle(-0.5, 0, 1);
+    const overflow = similarityEdgeStyle(2, 0, 1);
+    expect(underflow.opacity).toBeCloseTo(0.3);
+    expect(overflow.opacity).toBeCloseTo(0.9);
   });
 });
 

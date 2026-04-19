@@ -44,11 +44,11 @@ export const graphStylesheet: StylesheetCSS[] = [
   {
     selector: "edge.similarity",
     css: {
-      width: "mapData(weight, 0, 1, 1, 4)",
-      "line-color": "mapData(weight, 0, 1, #e5e7eb, #1f2937)",
+      width: "data(lineWidth)",
+      "line-color": "data(color)",
       "line-style": "dashed",
       "curve-style": "bezier",
-      opacity: "mapData(weight, 0, 1, 0.35, 0.85)",
+      opacity: "data(opacity)",
     },
   },
   {
