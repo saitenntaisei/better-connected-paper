@@ -33,6 +33,16 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
+        # Fork PRs cannot read CLAUDE_CODE_OAUTH_TOKEN (GitHub withholds
+        # secrets from workflows triggered by pull_request events on forks),
+        # so the action would fail with an auth error and, if `claude-review`
+        # is a required status check in branch protection, the PR would
+        # deadlock — unmergeable until an admin overrides. Skipping the step
+        # on fork PRs keeps the job green (vacuously) so branch protection
+        # unblocks; maintainers still review fork PRs manually before merge.
+        # Internal branch PRs and Dependabot PRs (same-repo head) run the
+        # review normally.
+        if: github.event.pull_request.head.repo.full_name == github.repository
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

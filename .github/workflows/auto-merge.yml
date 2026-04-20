@@ -1,0 +1,57 @@
+name: Auto-merge Dependabot PRs
+
+# How this works:
+#   - GITHUB_TOKEN is read-only by default for Dependabot-triggered workflows.
+#     The `permissions:` block below elevates it (this is the pattern GitHub
+#     documents for Dependabot auto-merge; `pull_request_target` is NOT needed
+#     and is discouraged here because it carries fork-PR security risk that
+#     this workflow doesn't need).
+#   - `gh pr merge --auto` queues the PR for merge. Branch protection gates
+#     when the merge actually lands — the PR waits until every required
+#     status check passes. Without branch protection, auto-merge merges
+#     immediately, so configuring protection is required for CI gating.
+#
+# REQUIRED one-time setup (all via the GitHub UI):
+#   1. Settings → General → Pull Requests:
+#        ☑ Allow auto-merge
+#        ☑ Automatically delete head branches  (recommended)
+#   2. Settings → Actions → General → Workflow permissions:
+#        ☑ Allow GitHub Actions to create and approve pull requests
+#        (needed so GITHUB_TOKEN can flag auto-merge on Dependabot PRs)
+#   3. Settings → Branches → Branch protection rule for `main`:
+#        ☑ Require status checks to pass before merging
+#        Required checks: Backend, Backend integration, Frontend, claude-review
+#   4. Settings → Secrets and variables → Dependabot:
+#        Add `CLAUDE_CODE_OAUTH_TOKEN` with the same value as the Actions
+#        secret of the same name. Dependabot-triggered workflows CANNOT read
+#        Actions secrets — only Dependabot secrets. Without this mirror the
+#        `claude-review` check will fail on every Dependabot PR because the
+#        OAuth token comes through as an empty string, and auto-merge will
+#        never fire. Add other required secrets to the Dependabot store too
+#        if claude-code-review.yml grows new references.
+#
+# Fork PRs (external contributors): the filter below scopes this workflow to
+# `dependabot[bot]` PRs only, so fork PRs never get flagged for auto-merge —
+# that is the right behavior; external contributions need human review. The
+# `claude-review` step in claude-code-review.yml is skipped on fork PRs (the
+# job still returns success so branch protection does not deadlock on the
+# missing secret). Fork PRs then pass required checks and the maintainer
+# merges them manually after review.
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"

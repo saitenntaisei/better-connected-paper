@@ -1,0 +1,63 @@
+name: Update mise tool versions
+
+# CI gating requires a non-GITHUB_TOKEN to open the PR — GitHub suppresses
+# workflow_run events on PRs opened with GITHUB_TOKEN to prevent recursive
+# runs, so ci.yml would not execute against the bump PR. Set repository
+# secret MISE_BUMP_TOKEN to a classic PAT (repo scope) or a fine-grained
+# token with contents:write + pull-requests:write on this repo. The step
+# below falls back to GITHUB_TOKEN if the secret is unset, but in that case
+# ci.yml must be triggered manually by closing and reopening the PR.
+
+on:
+  schedule:
+    - cron: '30 5 * * 1'
+  workflow_dispatch:
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: Bump to latest pinned versions
+        run: |
+          mise use go@latest --pin
+          mise use node@latest --pin
+      - name: Open PR if mise.toml changed
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.MISE_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          branch: chore/mise-tool-bump
+          commit-message: "chore(mise): bump Go and Node to latest"
+          title: "chore(mise): bump Go and Node to latest"
+          body: |
+            Automated weekly bump of Go and Node in `mise.toml` to their
+            current latest releases.
+
+            Auto-merge is enabled — the PR lands as soon as every required
+            status check passes (branch protection configures the gate).
+            If CI checks are missing on this PR, the `MISE_BUMP_TOKEN` secret
+            is not configured — GITHUB_TOKEN cannot trigger `ci.yml`. See the
+            comment block at the top of `.github/workflows/update-mise-tools.yml`
+            for setup, or close and reopen this PR to trigger CI manually.
+
+            Review against the CI run before it auto-merges if a major Go or
+            Node bump landed — these may need matching changes in:
+              - `backend/Dockerfile` (`golang:<ver>-alpine`)
+              - `frontend/Dockerfile` (`node:<ver>-alpine`)
+              - `backend/go.mod` (`go 1.xx`)
+              - CI `services:` image tags (Dependabot cannot parse these)
+          labels: dependencies
+          delete-branch: true
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-operation == 'created' || steps.cpr.outputs.pull-request-operation == 'updated'
+        env:
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+          GH_TOKEN: ${{ secrets.MISE_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
