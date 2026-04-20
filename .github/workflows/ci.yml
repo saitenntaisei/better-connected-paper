@@ -18,7 +18,7 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: jdx/mise-action@v2
         with:
           cache: true
@@ -55,7 +55,7 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/better_connected_paper?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: jdx/mise-action@v2
         with:
           cache: true
@@ -70,7 +70,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: jdx/mise-action@v2
         with:
           cache: true
