@@ -30,7 +30,7 @@ jobs:
           mise use node@latest --pin
       - name: Open PR if mise.toml changed
         id: cpr
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.MISE_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
           branch: chore/mise-tool-bump
