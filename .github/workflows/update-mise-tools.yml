@@ -21,7 +21,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           cache: true
       - name: Bump to latest pinned versions

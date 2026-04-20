@@ -19,7 +19,7 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           cache: true
       - name: go vet
@@ -56,7 +56,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/better_connected_paper?sslmode=disable
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           cache: true
       - name: Integration tests
@@ -71,7 +71,7 @@ jobs:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           cache: true
       - name: Install dependencies
