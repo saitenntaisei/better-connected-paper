@@ -38,6 +38,13 @@ export default function App() {
     [setUrlSeed],
   );
 
+  const rebuildFromNode = useCallback(
+    (id: string) => {
+      if (id !== urlSeed) setUrlSeed(id);
+    },
+    [urlSeed, setUrlSeed],
+  );
+
   const loading = searchState.status === "loading";
   const results = useMemo(
     () => (searchState.status === "success" ? searchState.data.results : []),
@@ -102,6 +109,7 @@ export default function App() {
               <Graph
                 data={graphState.data}
                 onSelectNode={setFocusId}
+                onSeedChange={rebuildFromNode}
                 showSimilarity={showSimilarity}
               />
             )}

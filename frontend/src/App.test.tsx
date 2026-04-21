@@ -3,8 +3,25 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./components/Graph", () => ({
-  Graph: ({ data }: { data: { seed: { title: string } } }) => (
-    <div data-testid="graph-stub">graph:{data.seed.title}</div>
+  Graph: ({
+    data,
+    onSeedChange,
+  }: {
+    data: { seed: { title: string } };
+    onSeedChange?: (id: string) => void;
+  }) => (
+    <div data-testid="graph-stub">
+      graph:{data.seed.title}
+      {onSeedChange && (
+        <button
+          type="button"
+          data-testid="graph-dblclick-A"
+          onClick={() => onSeedChange("A")}
+        >
+          reseed to A
+        </button>
+      )}
+    </div>
   ),
 }));
 
@@ -79,6 +96,45 @@ describe("App", () => {
     const urls = vi.mocked(globalThis.fetch).mock.calls.map((c) => String(c[0]));
     expect(urls).toContain("/api/graph/build");
     expect(new URL(window.location.href).searchParams.get("seed")).toBe("p1");
+  });
+
+  it("rebuilds graph when a node is double-clicked", async () => {
+    const buildCalls: string[] = [];
+    globalThis.fetch = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === "/api/graph/build") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as { seedId?: string };
+          const seedId = body.seedId ?? "unknown";
+          buildCalls.push(seedId);
+          return json({
+            seed: { id: seedId, title: `paper-${seedId}`, similarity: 0, isSeed: true },
+            nodes: [],
+            edges: [],
+            builtAt: "2026-04-18T00:00:00Z",
+          });
+        }
+        if (url.startsWith("/api/paper/")) {
+          return json({ paperId: "x", title: "x" });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+    window.history.replaceState({}, "", "/?seed=first");
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:paper-first");
+    });
+
+    await user.click(screen.getByTestId("graph-dblclick-A"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:paper-A");
+    });
+    expect(buildCalls).toEqual(["first", "A"]);
+    expect(new URL(window.location.href).searchParams.get("seed")).toBe("A");
   });
 
   it("rebuilds graph when popstate advances the seed via URL", async () => {

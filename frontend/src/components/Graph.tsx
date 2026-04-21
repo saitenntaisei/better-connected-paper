@@ -16,10 +16,11 @@ function ensureRegistered() {
 type Props = {
   data: GraphResponse;
   onSelectNode?: (id: string) => void;
+  onSeedChange?: (id: string) => void;
   showSimilarity?: boolean;
 };
 
-export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
+export function Graph({ data, onSelectNode, onSeedChange, showSimilarity = true }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
 
@@ -49,6 +50,11 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
       onSelectNode?.(evt.target.id());
     };
     cy.on("tap", "node", tapHandler);
+
+    const dblclickHandler = (evt: cytoscape.EventObject) => {
+      onSeedChange?.(evt.target.id());
+    };
+    cy.on("dblclick", "node", dblclickHandler);
 
     const clearHighlight = () => {
       cy.elements().removeClass("path-dim path-hit");
@@ -86,12 +92,13 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
 
     return () => {
       cy.off("tap", "node", tapHandler);
+      cy.off("dblclick", "node", dblclickHandler);
       cy.off("mouseover", "node", hoverHandler);
       cy.off("mouseout", "node", clearHighlight);
       cy.destroy();
       cyRef.current = null;
     };
-  }, [data, onSelectNode, showSimilarity]);
+  }, [data, onSelectNode, onSeedChange, showSimilarity]);
 
   return (
     <div

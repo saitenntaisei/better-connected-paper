@@ -59,4 +59,17 @@ describe("Graph", () => {
     unmount();
     expect(instance.destroy).toHaveBeenCalled();
   });
+
+  it("routes node double-clicks to onSeedChange", () => {
+    const onSeedChange = vi.fn();
+    render(<Graph data={sample} onSeedChange={onSeedChange} />);
+    const instance = cyInstances[0];
+    const dblclickCall = instance.on.mock.calls.find(
+      (args) => args[0] === "dblclick" && args[1] === "node",
+    );
+    expect(dblclickCall).toBeDefined();
+    const handler = dblclickCall![2] as (evt: { target: { id: () => string } }) => void;
+    handler({ target: { id: () => "A" } });
+    expect(onSeedChange).toHaveBeenCalledWith("A");
+  });
 });

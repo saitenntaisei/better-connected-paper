@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useUrlSeed } from "./useUrlSeed";
 
 describe("useUrlSeed", () => {
@@ -8,6 +8,7 @@ describe("useUrlSeed", () => {
   });
   afterEach(() => {
     window.history.replaceState({}, "", "/");
+    vi.restoreAllMocks();
   });
 
   it("reads the current ?seed= param on mount", () => {
@@ -33,5 +34,29 @@ describe("useUrlSeed", () => {
     });
     expect(result.current.seed).toBeNull();
     expect(new URL(window.location.href).searchParams.get("seed")).toBeNull();
+  });
+
+  it("pushes history on seed → seed transitions so Back returns to the prior graph", () => {
+    const pushSpy = vi.spyOn(window.history, "pushState");
+    const replaceSpy = vi.spyOn(window.history, "replaceState");
+    const { result } = renderHook(() => useUrlSeed());
+
+    act(() => {
+      result.current.setSeed("abc");
+    });
+    expect(pushSpy).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current.setSeed("def");
+    });
+    expect(pushSpy).toHaveBeenCalledTimes(2);
+    expect(result.current.seed).toBe("def");
+
+    // re-setting the same id must not push a duplicate entry
+    act(() => {
+      result.current.setSeed("def");
+    });
+    expect(pushSpy).toHaveBeenCalledTimes(2);
+    expect(replaceSpy).toHaveBeenCalled();
   });
 });

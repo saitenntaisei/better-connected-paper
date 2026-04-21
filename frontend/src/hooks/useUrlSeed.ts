@@ -30,10 +30,11 @@ export function useUrlSeed() {
     const previous = readFromLocation();
     if (id) url.searchParams.set(PARAM, id);
     else url.searchParams.delete(PARAM);
-    // null → seed creates a new entry so browser Back returns to search.
-    // seed → null is only used as a direct-URL fallback (the "← Back" button
-    // prefers history.back() when it can), so replaceState keeps history clean.
-    if (id && previous === null) {
+    // Push whenever we land on a new non-null seed so browser Back returns to
+    // the previous view — covers both null → seed (search selection) and
+    // seed → seed (drill-in via node double-click). seed → null and no-op
+    // writes use replaceState to avoid polluting history.
+    if (id && previous !== id) {
       window.history.pushState({ kind: STATE_MARK }, "", url.toString());
     } else {
       window.history.replaceState(window.history.state, "", url.toString());
