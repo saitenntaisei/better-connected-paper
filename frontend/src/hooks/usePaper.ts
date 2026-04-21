@@ -9,18 +9,22 @@ export type PaperState =
   | { status: "error"; id: string; error: string };
 
 export function usePaper(id: string | null | undefined) {
-  const [state, setState] = useState<PaperState>({ status: "idle" });
+  const [state, setState] = useState<PaperState>(
+    id ? { status: "loading", id } : { status: "idle" },
+  );
+  const [prevId, setPrevId] = useState(id);
   const abortRef = useRef<AbortController | null>(null);
+
+  if (id !== prevId) {
+    setPrevId(id);
+    setState(id ? { status: "loading", id } : { status: "idle" });
+  }
 
   useEffect(() => {
     abortRef.current?.abort();
-    if (!id) {
-      setState({ status: "idle" });
-      return;
-    }
+    if (!id) return;
     const ctl = new AbortController();
     abortRef.current = ctl;
-    setState({ status: "loading", id });
     getPaper(id, { signal: ctl.signal })
       .then((data) => {
         if (ctl.signal.aborted) return;

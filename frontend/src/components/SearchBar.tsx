@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 type Props = {
   onSubmit: (query: string) => void;
@@ -9,9 +9,11 @@ type Props = {
 
 export function SearchBar({ onSubmit, initial = "", busy = false, placeholder }: Props) {
   const [value, setValue] = useState(initial);
-  useEffect(() => {
+  const [prevInitial, setPrevInitial] = useState(initial);
+  if (initial !== prevInitial) {
+    setPrevInitial(initial);
     setValue(initial);
-  }, [initial]);
+  }
   const trimmed = value.trim();
 
   return (
