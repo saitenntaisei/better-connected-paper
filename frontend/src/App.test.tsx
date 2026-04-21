@@ -7,19 +7,28 @@ vi.mock("./components/Graph", () => ({
     data,
     onSeedChange,
   }: {
-    data: { seed: { title: string } };
+    data: { seed: { id: string; title: string } };
     onSeedChange?: (id: string) => void;
   }) => (
     <div data-testid="graph-stub">
       graph:{data.seed.title}
       {onSeedChange && (
-        <button
-          type="button"
-          data-testid="graph-dblclick-A"
-          onClick={() => onSeedChange("A")}
-        >
-          reseed to A
-        </button>
+        <>
+          <button
+            type="button"
+            data-testid="graph-dblclick-A"
+            onClick={() => onSeedChange("A")}
+          >
+            reseed to A
+          </button>
+          <button
+            type="button"
+            data-testid="graph-dblclick-seed"
+            onClick={() => onSeedChange(data.seed.id)}
+          >
+            reseed to current seed
+          </button>
+        </>
       )}
     </div>
   ),
@@ -182,6 +191,58 @@ describe("App", () => {
       expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:paper-first");
     });
     expect(buildCalls).toEqual(["first", "A"]);
+  });
+
+  it("double-clicking the current seed node is a no-op for canonicalized aliases", async () => {
+    const buildCalls: string[] = [];
+    globalThis.fetch = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === "/api/graph/build") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as { seedId?: string };
+          buildCalls.push(body.seedId ?? "unknown");
+          // Backend normalizes the DOI alias to a canonical W-id.
+          return json({
+            seed: { id: "W123", title: "canonical paper", similarity: 0, isSeed: true },
+            nodes: [],
+            edges: [],
+            builtAt: "2026-04-18T00:00:00Z",
+          });
+        }
+        if (url.startsWith("/api/paper/")) {
+          return json({ paperId: "x", title: "x" });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+    window.history.replaceState({}, "", "/?seed=doi:10.1038/xyz");
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:canonical paper");
+    });
+    expect(buildCalls).toEqual(["doi:10.1038/xyz"]);
+
+    const pushSpy = vi.spyOn(window.history, "pushState");
+    try {
+      // User dbl-clicks the seed node itself. The rendered node id is "W123"
+      // (canonical) while the URL still holds the DOI — this must not rebuild.
+      await user.click(screen.getByTestId("graph-dblclick-seed"));
+
+      // Let any would-be effects flush.
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(buildCalls).toEqual(["doi:10.1038/xyz"]);
+      expect(pushSpy).not.toHaveBeenCalled();
+      expect(new URL(window.location.href).searchParams.get("seed")).toBe(
+        "doi:10.1038/xyz",
+      );
+    } finally {
+      pushSpy.mockRestore();
+    }
   });
 
   it("rebuilds graph when popstate advances the seed via URL", async () => {

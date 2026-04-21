@@ -38,11 +38,19 @@ export default function App() {
     [setUrlSeed],
   );
 
+  // The backend canonicalizes seed aliases (e.g. DOI → OpenAlex W-id), so the
+  // rendered seed node's id may not equal the raw `?seed=` string. Compare
+  // against the canonical seed id too, or else dbl-clicking the seed node of a
+  // DOI-linked graph would push a redundant history entry and re-POST
+  // /graph/build.
+  const canonicalSeedId =
+    graphState.status === "success" ? graphState.data.seed.id : null;
   const rebuildFromNode = useCallback(
     (id: string) => {
-      if (id !== urlSeed) setUrlSeed(id);
+      if (id === urlSeed || id === canonicalSeedId) return;
+      setUrlSeed(id);
     },
-    [urlSeed, setUrlSeed],
+    [urlSeed, canonicalSeedId, setUrlSeed],
   );
 
   const loading = searchState.status === "loading";

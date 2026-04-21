@@ -37,6 +37,12 @@ export function useGraph() {
       const data = await buildGraph(trimmed, fresh, { signal: ctl.signal });
       if (ctl.signal.aborted) return;
       cacheRef.current.set(trimmed, data);
+      // The backend canonicalizes the seed id (e.g. DOI → W-id), so alias the
+      // cache under both the raw lookup key and the canonical id. That way a
+      // later build() call keyed by either form restores from memory.
+      if (data.seed.id && data.seed.id !== trimmed) {
+        cacheRef.current.set(data.seed.id, data);
+      }
       setState({ status: "success", seedId: trimmed, data });
     } catch (err) {
       if (ctl.signal.aborted) return;
