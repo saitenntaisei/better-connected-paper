@@ -41,11 +41,15 @@ jobs:
         # on fork PRs keeps the job green (vacuously) so branch protection
         # unblocks; maintainers still review fork PRs manually before merge.
         # Internal branch PRs and Dependabot PRs (same-repo head) run the
-        # review normally.
+        # review normally. claude-code-action blocks bot actors by default;
+        # `allowed_bots` must list `dependabot[bot]` explicitly so the
+        # `claude-review` required status check passes on Dependabot PRs and
+        # auto-merge can proceed.
         if: github.event.pull_request.head.repo.full_name == github.repository
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: 'dependabot[bot]'
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
