@@ -20,9 +20,11 @@ export default function App() {
 
   // Reset the detail-panel focus whenever the seed changes — including the
   // popstate case, which updates urlSeed without going through selectSeed.
-  useEffect(() => {
+  const [prevUrlSeed, setPrevUrlSeed] = useState(urlSeed);
+  if (urlSeed !== prevUrlSeed) {
+    setPrevUrlSeed(urlSeed);
     setFocusId(urlSeed);
-  }, [urlSeed]);
+  }
 
   useEffect(() => {
     if (!urlSeed) return;
