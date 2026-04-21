@@ -137,6 +137,53 @@ describe("App", () => {
     expect(new URL(window.location.href).searchParams.get("seed")).toBe("A");
   });
 
+  it("restores previously built graphs from in-memory cache on popstate", async () => {
+    const buildCalls: string[] = [];
+    globalThis.fetch = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === "/api/graph/build") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as { seedId?: string };
+          const seedId = body.seedId ?? "unknown";
+          buildCalls.push(seedId);
+          return json({
+            seed: { id: seedId, title: `paper-${seedId}`, similarity: 0, isSeed: true },
+            nodes: [],
+            edges: [],
+            builtAt: "2026-04-18T00:00:00Z",
+          });
+        }
+        if (url.startsWith("/api/paper/")) {
+          return json({ paperId: "x", title: "x" });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+    window.history.replaceState({}, "", "/?seed=first");
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:paper-first");
+    });
+
+    // drill into "A"
+    await user.click(screen.getByTestId("graph-dblclick-A"));
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:paper-A");
+    });
+    expect(buildCalls).toEqual(["first", "A"]);
+
+    // Back to the prior graph — must hydrate from cache, not refetch.
+    await act(async () => {
+      window.history.back();
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:paper-first");
+    });
+    expect(buildCalls).toEqual(["first", "A"]);
+  });
+
   it("rebuilds graph when popstate advances the seed via URL", async () => {
     const buildCalls: string[] = [];
     globalThis.fetch = vi

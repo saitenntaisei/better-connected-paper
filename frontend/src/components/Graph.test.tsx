@@ -60,16 +60,19 @@ describe("Graph", () => {
     expect(instance.destroy).toHaveBeenCalled();
   });
 
-  it("routes node double-clicks to onSeedChange", () => {
+  it("routes node double-clicks and touch double-taps to onSeedChange", () => {
     const onSeedChange = vi.fn();
     render(<Graph data={sample} onSeedChange={onSeedChange} />);
     const instance = cyInstances[0];
-    const dblclickCall = instance.on.mock.calls.find(
-      (args) => args[0] === "dblclick" && args[1] === "node",
-    );
-    expect(dblclickCall).toBeDefined();
-    const handler = dblclickCall![2] as (evt: { target: { id: () => string } }) => void;
-    handler({ target: { id: () => "A" } });
-    expect(onSeedChange).toHaveBeenCalledWith("A");
+    for (const ev of ["dblclick", "dbltap"]) {
+      const call = instance.on.mock.calls.find(
+        (args) => args[0] === ev && args[1] === "node",
+      );
+      expect(call, `expected ${ev} handler to be registered`).toBeDefined();
+      const handler = call![2] as (evt: { target: { id: () => string } }) => void;
+      onSeedChange.mockClear();
+      handler({ target: { id: () => "A" } });
+      expect(onSeedChange).toHaveBeenCalledWith("A");
+    }
   });
 });

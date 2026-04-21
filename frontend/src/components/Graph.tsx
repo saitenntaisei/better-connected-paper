@@ -54,7 +54,12 @@ export function Graph({ data, onSelectNode, onSeedChange, showSimilarity = true 
     const dblclickHandler = (evt: cytoscape.EventObject) => {
       onSeedChange?.(evt.target.id());
     };
+    // Bind both the native mouse "dblclick" and Cytoscape's input-agnostic
+    // "dbltap" so touch devices (phones/tablets) can also reseed. A mouse
+    // double-click may fire both; duplicate setSeed with the same id is a
+    // no-op thanks to the guard in App.rebuildFromNode.
     cy.on("dblclick", "node", dblclickHandler);
+    cy.on("dbltap", "node", dblclickHandler);
 
     const clearHighlight = () => {
       cy.elements().removeClass("path-dim path-hit");
@@ -93,6 +98,7 @@ export function Graph({ data, onSelectNode, onSeedChange, showSimilarity = true 
     return () => {
       cy.off("tap", "node", tapHandler);
       cy.off("dblclick", "node", dblclickHandler);
+      cy.off("dbltap", "node", dblclickHandler);
       cy.off("mouseover", "node", hoverHandler);
       cy.off("mouseout", "node", clearHighlight);
       cy.destroy();
