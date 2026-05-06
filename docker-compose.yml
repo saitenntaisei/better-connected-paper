@@ -9,7 +9,10 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PG18+ stores data under /var/lib/postgresql/<MAJOR>/docker; mount the
+      # parent directory so future pg_upgrade --link runs stay within one
+      # mount point (docker-library/postgres#1259).
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bcp -d bcp"]
       interval: 2s
