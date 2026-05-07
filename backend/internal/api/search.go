@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/saitenntaisei/better-connected-paper/internal/citation"
 )
@@ -74,11 +75,12 @@ func (d Deps) doSearch(ctx context.Context, key, q string, limit int) (searchRes
 		if err != nil {
 			return searchResponse{}, err
 		}
+		deduped := collapseOpenAlexDOIAliases(resp.Data)
 		out := searchResponse{
 			Total:   resp.Total,
-			Results: make([]searchResult, 0, len(resp.Data)),
+			Results: make([]searchResult, 0, len(deduped)),
 		}
-		for _, p := range resp.Data {
+		for _, p := range deduped {
 			out.Results = append(out.Results, toSearchResult(p))
 		}
 		d.SearchCache.put(key, out)
@@ -117,4 +119,86 @@ func truncateAbstract(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// collapseOpenAlexDOIAliases drops the no-DOI half of OpenAlex's duplicate
+// Work records for the same arxiv preprint. OpenAlex frequently emits two
+// W-IDs per preprint — one carrying the arxiv DOI, one without — and the
+// DOI-less alias has no way to bridge into the hybrid supplement chain
+// (the seed-only AsyncVLA case). When a (title, year) group contains both
+// DOI-bearing and DOI-less entries, only the DOI-less ones are removed;
+// every DOI-bearing entry is kept, since two genuinely-distinct papers can
+// share a title+year and the DOI is the only signal we have that the
+// no-DOI member is an OpenAlex import alias rather than a real result.
+// Groups that are uniformly DOI or uniformly no-DOI are left untouched.
+func collapseOpenAlexDOIAliases(papers []citation.Paper) []citation.Paper {
+	if len(papers) < 2 {
+		return papers
+	}
+
+	type group struct {
+		anyDOI   bool
+		anyNoDOI bool
+	}
+	groups := make(map[string]*group, len(papers))
+	keys := make([]string, len(papers))
+
+	for i, p := range papers {
+		key := dedupeKey(p.Title, p.Year)
+		keys[i] = key
+		if key == "" {
+			continue
+		}
+		g, ok := groups[key]
+		if !ok {
+			g = &group{}
+			groups[key] = g
+		}
+		if paperHasDOI(p) {
+			g.anyDOI = true
+		} else {
+			g.anyNoDOI = true
+		}
+	}
+
+	out := make([]citation.Paper, 0, len(papers))
+	for i, p := range papers {
+		key := keys[i]
+		if key == "" {
+			out = append(out, p)
+			continue
+		}
+		g := groups[key]
+		if !(g.anyDOI && g.anyNoDOI) {
+			out = append(out, p)
+			continue
+		}
+		if paperHasDOI(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func dedupeKey(title string, year int) string {
+	nt := normalizeTitleForDedupe(title)
+	if nt == "" || year == 0 {
+		return ""
+	}
+	return nt + "|" + strconv.Itoa(year)
+}
+
+func normalizeTitleForDedupe(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+func paperHasDOI(p citation.Paper) bool {
+	return strings.TrimSpace(p.ExternalIDs["DOI"]) != ""
 }

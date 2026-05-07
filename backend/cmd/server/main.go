@@ -65,12 +65,12 @@ func main() {
 		return
 	}
 
-	paperClient := newPaperClient(logger)
+	paperClient, recommender, embedder := newPaperClient(logger)
 	var cache graph.Cache
 	if db != nil {
 		cache = db
 	}
-	builder := &graph.Builder{S2: paperClient, Cache: cache}
+	builder := &graph.Builder{S2: paperClient, Cache: cache, Recommender: recommender, Embedder: embedder, Logger: logger}
 	deps := api.Deps{S2: paperClient, DB: db, Builder: builder}
 
 	srv := &http.Server{
@@ -109,40 +109,49 @@ type paperClient interface {
 	api.PaperClient
 }
 
-func newPaperClient(logger *slog.Logger) paperClient {
+func newPaperClient(logger *slog.Logger) (paperClient, citation.Recommender, citation.Embedder) {
 	provider := strings.ToLower(strings.TrimSpace(os.Getenv("CITATION_PROVIDER")))
 	switch provider {
 	case "semanticscholar", "s2":
 		logger.Info("citation provider", "provider", "semanticscholar")
-		return citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
+		c := citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
+		return c, c, c
 	case "openalex":
 		logger.Info("citation provider", "provider", "openalex")
-		return citation.NewOpenAlex(citation.OpenAlexOptions{Mailto: os.Getenv("OPENALEX_EMAIL")})
+		return citation.NewOpenAlex(citation.OpenAlexOptions{Mailto: os.Getenv("OPENALEX_EMAIL")}), nil, nil
 	default:
 		// Default: OpenAlex primary with an OpenCitations supplement. OpenAlex
 		// skips ref parsing for many arxiv preprints (referenced_works_count
-		// comes back 0), and OpenCitations' v2 index fills that gap without
-		// S2's hostile 1-req/3-s anonymous rate limit. Tertiary is off by
-		// default — S2 is opt-in via CITATION_TERTIARY=semanticscholar only,
-		// so the hot path never blocks on S2's anonymous rate limit.
+		// comes back 0), and OpenCitations' v2 index fills that gap. Tertiary
+		// auto-enables to S2 whenever a key is available (newHybridTertiary)
+		// — the keyed 1 RPS limit is workable on the supplement path, and
+		// exposes the /recommendations + embeddings endpoints that the
+		// Builder leans on for sparse-seed expansion and edge wiring.
 		primary := citation.NewOpenAlex(citation.OpenAlexOptions{Mailto: os.Getenv("OPENALEX_EMAIL")})
 		disableHybrid := strings.EqualFold(os.Getenv("CITATION_HYBRID"), "false")
 		if disableHybrid {
 			logger.Info("citation provider", "provider", "openalex", "hybrid", false)
-			return primary
+			return primary, nil, nil
 		}
 		secondary := newHybridSecondary(logger, primary)
 		tertiary := newHybridTertiary(logger, primary, secondary)
 		if secondary == nil && tertiary == nil {
 			logger.Info("citation provider", "provider", "openalex", "hybrid", false)
-			return primary
+			return primary, nil, nil
 		}
-		return &citation.HybridClient{
+		hc := &citation.HybridClient{
 			Primary:   primary,
 			Secondary: secondary,
 			Tertiary:  tertiary,
 			Logger:    logger,
 		}
+		var rec citation.Recommender
+		var emb citation.Embedder
+		if tertiary != nil {
+			rec = tertiary
+			emb = tertiary
+		}
+		return hc, rec, emb
 	}
 }
 
@@ -168,15 +177,18 @@ func newHybridSecondary(logger *slog.Logger, primary *citation.OpenAlexClient) c
 }
 
 // newHybridTertiary builds the optional tertiary provider wired into
-// HybridClient. Default is nil: primary (OpenAlex) + secondary
-// (OpenCitations) already cover the common case, and S2 — the only
-// provider that uniquely filled the arxiv-preprint gap — has an anonymous
-// rate limit (1 req / 3 s) that turned supplement calls into stalls and
-// 429 cascades during every cold graph build. Set
-// CITATION_TERTIARY=semanticscholar to opt back in when you have an API
-// key that raises that ceiling.
-func newHybridTertiary(logger *slog.Logger, primary *citation.OpenAlexClient, secondary citation.PaperProvider) citation.PaperProvider {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITATION_TERTIARY"))) {
+// HybridClient. Auto-promotes to S2 when SEMANTIC_SCHOLAR_API_KEY is set
+// (the 1 RPS keyed limit is workable on the supplement path and unlocks
+// the /recommendations endpoint for sparse-seed graphs). Set
+// CITATION_TERTIARY=off to opt out; without a key, default stays nil so
+// anonymous 1-req/3-s S2 doesn't stall every cold build.
+func newHybridTertiary(logger *slog.Logger, primary *citation.OpenAlexClient, secondary citation.PaperProvider) *citation.ResolvingTertiary {
+	sel := strings.ToLower(strings.TrimSpace(os.Getenv("CITATION_TERTIARY")))
+	if sel == "" && os.Getenv("SEMANTIC_SCHOLAR_API_KEY") != "" {
+		sel = "semanticscholar"
+		logger.Info("citation provider", "tertiary-default", "semanticscholar", "reason", "api-key-present")
+	}
+	switch sel {
 	case "semanticscholar", "s2":
 		// Skip if secondary is already S2 — avoids paying the S2 rate limit twice.
 		if _, isS2 := secondary.(*citation.Client); isS2 {

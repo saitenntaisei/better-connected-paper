@@ -26,6 +26,16 @@ services:
     environment:
       PORT: 8080
       DATABASE_URL: postgres://bcp:bcp@postgres:5432/bcp?sslmode=disable
+      # Citation-provider knobs. Each forwards from the host shell so .env
+      # values picked up by mise (or `docker compose --env-file`) reach the
+      # backend container. Defaults match cmd/server/main.go: hybrid OpenAlex
+      # primary + OpenCitations secondary, S2 tertiary off.
+      CITATION_PROVIDER: ${CITATION_PROVIDER:-}
+      CITATION_HYBRID: ${CITATION_HYBRID:-}
+      CITATION_SECONDARY: ${CITATION_SECONDARY:-}
+      CITATION_TERTIARY: ${CITATION_TERTIARY:-}
+      OPENALEX_EMAIL: ${OPENALEX_EMAIL:-}
+      OPENCITATIONS_TOKEN: ${OPENCITATIONS_TOKEN:-}
       SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
     ports:
       - "8080:8080"

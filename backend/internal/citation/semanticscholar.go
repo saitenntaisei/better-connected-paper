@@ -31,9 +31,13 @@ var ErrRateLimited = errors.New("semanticscholar: rate limited")
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
-	apiKey     string
-	limiter    *rate.Limiter
-	maxRetries int
+	// recsBaseURL is the sibling /recommendations/v1 root — it lives outside
+	// /graph/v1 on the same host, so the URL is derived from baseURL once at
+	// construction rather than threaded through every request.
+	recsBaseURL string
+	apiKey      string
+	limiter     *rate.Limiter
+	maxRetries  int
 }
 
 // Options configure the Client.
@@ -69,12 +73,14 @@ func New(opts Options) *Client {
 	if opts.MaxRetries == 0 {
 		opts.MaxRetries = 3
 	}
+	base := strings.TrimRight(opts.BaseURL, "/")
 	return &Client{
-		httpClient: opts.HTTPClient,
-		baseURL:    strings.TrimRight(opts.BaseURL, "/"),
-		apiKey:     opts.APIKey,
-		limiter:    rate.NewLimiter(rate.Limit(opts.RPS), opts.Burst),
-		maxRetries: opts.MaxRetries,
+		httpClient:  opts.HTTPClient,
+		baseURL:     base,
+		recsBaseURL: strings.TrimSuffix(base, "/graph/v1") + "/recommendations/v1",
+		apiKey:      opts.APIKey,
+		limiter:     rate.NewLimiter(rate.Limit(opts.RPS), opts.Burst),
+		maxRetries:  opts.MaxRetries,
 	}
 }
 
@@ -134,6 +140,78 @@ func (c *Client) GetCitationsFrom(ctx context.Context, id string, offset, limit 
 		return nil, err
 	}
 	return papers, nil
+}
+
+// Recommend returns up to limit papers similar to id from S2's
+// /recommendations/v1/papers/forpaper/{id} endpoint. This is the same
+// recommendation source Connected Papers uses, and it's the only way to
+// surface related work for brand-new arxiv preprints whose direct refs/cites
+// have not yet been ingested into the S2 graph (the AsyncVLA case).
+func (c *Client) Recommend(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(limit))
+	if len(fields) > 0 {
+		q.Set("fields", strings.Join(fields, ","))
+	}
+
+	var raw struct {
+		RecommendedPapers []Paper `json:"recommendedPapers"`
+	}
+	target := c.recsBaseURL + "/papers/forpaper/" + url.PathEscape(id) + "?" + q.Encode()
+	if err := c.do(ctx, http.MethodGet, target, nil, &raw); err != nil {
+		return nil, err
+	}
+	return raw.RecommendedPapers, nil
+}
+
+// EmbeddingsByExternalID fetches specter_v2 paper embeddings for ids and
+// returns them keyed by the *input* id (positional match against S2's
+// /paper/batch response). Brand-new arxiv preprints often surface in S2
+// only via "ARXIV:<id>" — their externalIds.DOI is empty — so callers
+// pair "DOI:<doi>" and "ARXIV:<arxiv>" queries for the same paper and
+// look up under whichever form S2 recognised.
+//
+// Missing or embedding-less entries are silently dropped: callers
+// already iterate a superset of selected nodes.
+func (c *Client) EmbeddingsByExternalID(ctx context.Context, ids []string) (map[string][]float32, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	q := url.Values{}
+	q.Set("fields", "paperId,externalIds,embedding.specter_v2")
+	body, err := json.Marshal(map[string][]string{"ids": ids})
+	if err != nil {
+		return nil, err
+	}
+	var raw []json.RawMessage
+	if err := c.do(ctx, http.MethodPost, "/paper/batch?"+q.Encode(), bytes.NewReader(body), &raw); err != nil {
+		return nil, err
+	}
+	out := make(map[string][]float32, len(raw))
+	for i, r := range raw {
+		if i >= len(ids) {
+			break
+		}
+		if len(r) == 0 || string(r) == "null" {
+			continue
+		}
+		var p struct {
+			Embedding struct {
+				Vector []float32 `json:"vector"`
+			} `json:"embedding"`
+		}
+		if err := json.Unmarshal(r, &p); err != nil {
+			return nil, fmt.Errorf("decode embedding entry: %w", err)
+		}
+		if len(p.Embedding.Vector) == 0 {
+			continue
+		}
+		out[ids[i]] = p.Embedding.Vector
+	}
+	return out, nil
 }
 
 // GetPaperBatch retrieves up to 500 papers in a single POST.
@@ -236,6 +314,13 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 		reqBody = b
 	}
 
+	// Allow Recommend to pass an already-fully-qualified URL (it lives under
+	// the sibling /recommendations/v1 root rather than /graph/v1).
+	target := path
+	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
+		target = c.baseURL + path
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if err := c.limiter.Wait(ctx); err != nil {
@@ -246,7 +331,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 		if reqBody != nil {
 			r = bytes.NewReader(reqBody)
 		}
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, r)
+		req, err := http.NewRequestWithContext(ctx, method, target, r)
 		if err != nil {
 			return err
 		}

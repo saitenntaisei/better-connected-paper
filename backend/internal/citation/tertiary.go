@@ -236,6 +236,104 @@ func (r *ResolvingTertiary) translateRefsBatch(ctx context.Context, papers []Pap
 	}
 }
 
+// Recommend forwards to the inner provider's recommendations endpoint
+// (typically S2 /recommendations/v1/papers/forpaper/{id}) and translates
+// each rec into a primary-space W-ID via the DOI resolver. When a rec
+// only carries an ArXiv id, the canonical 10.48550/arxiv.<id> DOI is
+// synthesised so OpenAlex can still resolve it — most recent preprints
+// ship with ArXiv-only externalIds.
+//
+// Returns (nil, nil) if the inner provider doesn't implement Recommender;
+// callers treat that as "no recommendations available" and continue.
+func (r *ResolvingTertiary) Recommend(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+	rec, ok := r.Inner.(Recommender)
+	if !ok {
+		return nil, nil
+	}
+	enriched := enrichRecommendFields(fields)
+	raw, err := rec.Recommend(ctx, id, limit, enriched)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || r.Resolver == nil {
+		return nil, nil
+	}
+	dois := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, p := range raw {
+		d := canonicalDOIFromExternalIDs(p.ExternalIDs)
+		if d == "" {
+			continue
+		}
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		dois = append(dois, d)
+	}
+	if len(dois) == 0 {
+		return nil, nil
+	}
+	resolved, err := r.Resolver(ctx, dois)
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("tertiary: rec resolver failed", "err", err, "count", len(dois))
+		}
+		return nil, err
+	}
+	return resolved, nil
+}
+
+// EmbeddingsByExternalID delegates to the inner provider when it implements
+// Embedder (the S2 client does). The tertiary doesn't translate IDs here:
+// callers key embeddings by DOI directly, so no W-ID resolution is needed.
+// Returns (nil, nil) if the inner can't supply embeddings — callers treat
+// that as "no embedding-similarity edges for this build".
+func (r *ResolvingTertiary) EmbeddingsByExternalID(ctx context.Context, ids []string) (map[string][]float32, error) {
+	if e, ok := r.Inner.(Embedder); ok {
+		return e.EmbeddingsByExternalID(ctx, ids)
+	}
+	return nil, nil
+}
+
+// canonicalDOIFromExternalIDs prefers an explicit DOI but synthesises the
+// arxiv-DOI form (10.48550/arxiv.<id>) when only an ArXiv id is present —
+// modern arxiv preprints commonly ship that way and OpenAlex resolves the
+// arxiv-DOI cleanly.
+func canonicalDOIFromExternalIDs(ext ExternalIDs) string {
+	if d := strings.ToLower(strings.TrimSpace(ext["DOI"])); d != "" {
+		return d
+	}
+	if a := strings.TrimSpace(ext["ArXiv"]); a != "" {
+		return "10.48550/arxiv." + strings.ToLower(a)
+	}
+	return ""
+}
+
+// enrichRecommendFields ensures the inner Recommend response carries the
+// externalIds we need to resolve DOIs/ArXiv ids back into W-IDs. The
+// caller's own field requests are preserved.
+func enrichRecommendFields(fields []string) []string {
+	hasPaperID, hasExt := false, false
+	for _, f := range fields {
+		switch f {
+		case "paperId":
+			hasPaperID = true
+		case "externalIds":
+			hasExt = true
+		}
+	}
+	out := make([]string, 0, len(fields)+2)
+	out = append(out, fields...)
+	if !hasPaperID {
+		out = append(out, "paperId")
+	}
+	if !hasExt {
+		out = append(out, "externalIds")
+	}
+	return out
+}
+
 // translate collects DOIs from the items' externalIds and resolves them
 // to W-ID Papers via the injected resolver. Items without DOIs are
 // dropped — the builder only needs PaperIDs, and an un-resolvable ref

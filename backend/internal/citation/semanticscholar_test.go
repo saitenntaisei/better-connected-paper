@@ -50,6 +50,75 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsByExternalID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/paper/batch", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("fields"); got != "paperId,externalIds,embedding.specter_v2" {
+			t.Errorf("fields query: got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"paperId": "p1", "externalIds": map[string]string{"DOI": "10.1/A"}, "embedding": map[string]any{"vector": []float32{0.1, 0.2, 0.3}}},
+			{"paperId": "p2", "externalIds": map[string]string{"DOI": "10.1/b"}, "embedding": map[string]any{"vector": []float32{0.4, 0.5, 0.6}}},
+			nil, // 3rd id was missing in S2 — must be skipped, not error
+			{"paperId": "p3", "externalIds": map[string]string{"DOI": "10.1/c"}}, // no embedding — skipped
+		})
+	})
+	c := newTestClient(t, mux)
+
+	got, err := c.EmbeddingsByExternalID(context.Background(), []string{"DOI:10.1/A", "DOI:10.1/b", "DOI:10.1/missing", "DOI:10.1/c"})
+	if err != nil {
+		t.Fatalf("embeddings: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 embeddings (only p1+p2 have vectors), got %d: %v", len(got), got)
+	}
+	// Keys mirror the caller's input ids (positional match against the
+	// batch response) so callers can register multiple lookups per paper —
+	// "DOI:..." and "ARXIV:..." — and consult either form.
+	if v, ok := got["DOI:10.1/A"]; !ok || len(v) != 3 {
+		t.Errorf("p1 missing or wrong dim: %+v", got)
+	}
+	if _, ok := got["DOI:10.1/b"]; !ok {
+		t.Errorf("p2 missing")
+	}
+	if _, ok := got["DOI:10.1/missing"]; ok {
+		t.Errorf("null entry must not produce an embedding")
+	}
+	if _, ok := got["DOI:10.1/c"]; ok {
+		t.Errorf("entry without embedding must not appear")
+	}
+}
+
+func TestRecommend(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/recommendations/v1/papers/forpaper/SEED", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("limit") != "20" {
+			t.Errorf("limit got %q want 20", r.URL.Query().Get("limit"))
+		}
+		if r.URL.Query().Get("fields") != "paperId,externalIds,title" {
+			t.Errorf("fields got %q", r.URL.Query().Get("fields"))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"recommendedPapers": []Paper{
+				{PaperID: "rec1", Title: "ProbeFlow", ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
+				{PaperID: "rec2", Title: "AR-VLA", ExternalIDs: ExternalIDs{"ArXiv": "2511.99002", "DOI": "10.48550/arxiv.2511.99002"}},
+			},
+		})
+	})
+	c := newTestClient(t, mux)
+
+	got, err := c.Recommend(context.Background(), "SEED", 20, []string{"paperId", "externalIds", "title"})
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(got) != 2 || got[0].PaperID != "rec1" || got[1].PaperID != "rec2" {
+		t.Fatalf("unexpected: %+v", got)
+	}
+	if got[0].ExternalIDs["ArXiv"] != "2511.99001" {
+		t.Errorf("want ArXiv preserved, got %v", got[0].ExternalIDs)
+	}
+}
+
 func TestGetPaperNotFound(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/paper/missing", func(w http.ResponseWriter, _ *http.Request) {

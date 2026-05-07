@@ -3,8 +3,11 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"math"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/saitenntaisei/better-connected-paper/internal/citation"
@@ -32,7 +35,18 @@ type Cache interface {
 
 // Builder constructs the directed graph around a seed paper.
 type Builder struct {
-	S2        S2
+	S2 S2
+	// Recommender, when wired (typically the *citation.ResolvingTertiary
+	// fronting S2), is consulted only for sparse seeds — papers that come
+	// back from S2/OpenAlex with too few refs+cites for the citation-based
+	// 2-hop expansion to surface a meaningful neighborhood. Recent arxiv
+	// preprints (the AsyncVLA case) routinely hit this path. Recs land in
+	// the first-hop candidate pool so the existing ranking + edge logic
+	// handles them like any other neighbor.
+	Recommender citation.Recommender
+	// Logger receives diagnostic events from the build (sparse-seed
+	// supplements, recommender hits/misses). Optional; nil silences output.
+	Logger    *slog.Logger
 	Cache     Cache
 	MaxNodes  int           // default 40
 	BatchSize int           // S2 batch cap: 500, we use 100 to keep responses small
@@ -60,6 +74,37 @@ type Builder struct {
 	// minute fetch that routinely rate-limits out. Ranking for a MaxNodes
 	// graph stays meaningful with a few hundred samples. Default 300.
 	MaxFirstHop int
+
+	// RecommendSparseThreshold is the refs+cites count below which the
+	// builder reaches for Recommender to broaden the candidate pool. Set
+	// negative to disable; zero picks the default (10), low enough that
+	// well-cited seeds skip the extra round-trip but high enough to catch
+	// recent preprints whose direct refs have not yet been ingested.
+	RecommendSparseThreshold int
+
+	// RecommendLimit caps how many recommendations are pulled per sparse
+	// seed. Default 30 — enough to roughly match a Connected-Papers cluster
+	// for new papers without dominating the firstHop budget.
+	RecommendLimit int
+
+	// Embedder, when wired (typically the same *citation.ResolvingTertiary
+	// fronting S2), produces specter_v2 paper embeddings that the builder
+	// uses to add a second similarity-edge layer. For seeds whose neighbors
+	// are all freshly-posted preprints — the AsyncVLA recs cluster — biblio
+	// coupling collapses to 0 (no provider has indexed the refs yet), so
+	// without embedding edges the cluster renders as disconnected dots.
+	Embedder citation.Embedder
+
+	// EmbeddingSimilarityThreshold is the minimum cosine on specter_v2 for
+	// considering an embedding-similarity edge. Default 0.7 — a soft floor;
+	// the per-node top-K trim is what actually controls visual density.
+	EmbeddingSimilarityThreshold float64
+
+	// EmbeddingTopK keeps each node's strongest K embedding-similarity
+	// neighbours (rather than every pair above threshold). Default 5 —
+	// roughly Connected-Papers' density. Raising it grows the graph
+	// quadratically so prefer adjusting threshold for noisier domains.
+	EmbeddingTopK int
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -142,7 +187,11 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	if seedAlias != "" {
 		excluded = append(excluded, seedAlias)
 	}
-	firstHopIDs := dedupeExcluding(append(append([]string(nil), seedRefs...), seedCitedBy...), excluded...)
+	recCandidates := b.recommendForSparseSeed(ctx, seed)
+	candidates := append([]string(nil), seedRefs...)
+	candidates = append(candidates, seedCitedBy...)
+	candidates = append(candidates, recCandidates...)
+	firstHopIDs := dedupeExcluding(candidates, excluded...)
 	if b.MaxFirstHop > 0 && len(firstHopIDs) > b.MaxFirstHop {
 		firstHopIDs = firstHopIDs[:b.MaxFirstHop]
 	}
@@ -228,6 +277,7 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	selectedSet := sliceSet(selectedIDs)
 	edges := buildCiteEdges(selectedIDs, selectedSet, linkSource)
 	edges = append(edges, buildSimilarityEdges(selectedIDs, linkSource, b.SimilarityEdgeThreshold)...)
+	edges = append(edges, b.embeddingSimilarityEdges(ctx, selectedIDs, linkSource)...)
 	edges = dedupeEdges(edges)
 
 	nodes, edges = pruneOrphanNodes(seedNode.ID, nodes, edges)
@@ -245,6 +295,10 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 // structural overlap with any other selected node, so Cytoscape layouts stack
 // them at the origin and the visualization reads worse than a smaller but
 // fully-connected graph. The seed is preserved unconditionally.
+//
+// Recommendation candidates rely on the embedding-similarity layer to surface
+// edges into the rest of the cluster — if S2 returns no embedding for a rec
+// it has no signal to draw, so prune-as-orphan is the right outcome.
 func pruneOrphanNodes(seedID string, nodes []Node, edges []Edge) ([]Node, []Edge) {
 	if len(nodes) == 0 {
 		return nodes, edges
@@ -308,6 +362,208 @@ func (b *Builder) batchFetch(ctx context.Context, ids []string, fields []string)
 		out = append(out, batch...)
 	}
 	return out, nil
+}
+
+// recommendForSparseSeed asks the Recommender for topical neighbours
+// when the seed's own refs+cites can't carry the 2-hop expansion. Empty
+// when the recommender isn't wired, the seed is dense enough, the seed
+// lacks a DOI/ArXiv id the recs endpoint can resolve, or the call errors.
+// Errors are swallowed: a failed recommendation must not block the build.
+func (b *Builder) recommendForSparseSeed(ctx context.Context, seed *citation.Paper) []string {
+	if b.Recommender == nil {
+		return nil
+	}
+	threshold := b.RecommendSparseThreshold
+	if threshold == 0 {
+		threshold = 10
+	}
+	if threshold < 0 {
+		return nil
+	}
+	count := len(seed.References) + len(seed.Citations)
+	if count >= threshold {
+		return nil
+	}
+	lookupID := s2RecommendID(seed)
+	if lookupID == "" {
+		if b.Logger != nil {
+			b.Logger.Info("recs: skipped, seed has no DOI/ArXiv id", "seed", seed.PaperID)
+		}
+		return nil
+	}
+	limit := b.RecommendLimit
+	if limit <= 0 {
+		limit = 30
+	}
+	recs, err := b.Recommender.Recommend(ctx, lookupID, limit, []string{"paperId", "externalIds", "title"})
+	if err != nil {
+		if b.Logger != nil {
+			b.Logger.Warn("recs: lookup failed", "seed", seed.PaperID, "lookup", lookupID, "err", err)
+		}
+		return nil
+	}
+	out := make([]string, 0, len(recs))
+	for _, p := range recs {
+		if p.PaperID != "" {
+			out = append(out, p.PaperID)
+		}
+	}
+	if b.Logger != nil {
+		b.Logger.Info("recs: sparse-seed augment", "seed", seed.PaperID, "lookup", lookupID, "raw", len(recs), "resolved", len(out), "seed_links", count, "threshold", threshold)
+	}
+	return out
+}
+
+// embeddingSimilarityEdges layers cosine-similarity edges over the
+// already-built citation/biblio edges. For each pair of selected nodes
+// that both expose a DOI or ArXiv id we ask the Embedder for specter_v2
+// vectors and emit a similarity edge when cosine ≥ threshold. dedupeEdges
+// later collapses any (kind, source, target) collision with the biblio
+// edges, so this layer purely fills gaps where biblio coupling produced
+// nothing — typically the recs cluster on a brand-new preprint seed.
+//
+// We send both "DOI:..." and "ARXIV:..." forms when applicable: many
+// recent arxiv preprints surface in S2 under ARXIV id only, with empty
+// externalIds.DOI, so a DOI-only query returns null.
+func (b *Builder) embeddingSimilarityEdges(ctx context.Context, selectedIDs []string, links map[string]citation.Paper) []Edge {
+	if b.Embedder == nil || len(selectedIDs) < 2 {
+		return nil
+	}
+	threshold := b.EmbeddingSimilarityThreshold
+	if threshold <= 0 {
+		threshold = 0.7
+	}
+	topK := b.EmbeddingTopK
+	if topK <= 0 {
+		topK = 5
+	}
+	queriesByNode := make(map[string][]string, len(selectedIDs))
+	allQueries := make([]string, 0, len(selectedIDs)*2)
+	for _, id := range selectedIDs {
+		p, ok := links[id]
+		if !ok {
+			continue
+		}
+		var qs []string
+		doi := strings.ToLower(strings.TrimSpace(p.ExternalIDs["DOI"]))
+		if doi != "" {
+			qs = append(qs, "DOI:"+doi)
+		}
+		arxiv := strings.TrimSpace(p.ExternalIDs["ArXiv"])
+		if arxiv == "" && strings.HasPrefix(doi, "10.48550/arxiv.") {
+			arxiv = strings.TrimPrefix(doi, "10.48550/arxiv.")
+		}
+		if arxiv != "" {
+			qs = append(qs, "ARXIV:"+arxiv)
+		}
+		if len(qs) == 0 {
+			continue
+		}
+		queriesByNode[id] = qs
+		allQueries = append(allQueries, qs...)
+	}
+	if len(allQueries) < 2 {
+		return nil
+	}
+	embsByQuery, err := b.Embedder.EmbeddingsByExternalID(ctx, allQueries)
+	if err != nil {
+		if b.Logger != nil {
+			b.Logger.Warn("embedder: lookup failed", "queried", len(allQueries), "err", err)
+		}
+		return nil
+	}
+	if len(embsByQuery) < 2 {
+		if b.Logger != nil {
+			b.Logger.Info("embedder: too few embeddings to wire similarity", "queried", len(allQueries), "received", len(embsByQuery))
+		}
+		return nil
+	}
+	nodeVec := func(id string) []float32 {
+		for _, q := range queriesByNode[id] {
+			if v, ok := embsByQuery[q]; ok && len(v) > 0 {
+				return v
+			}
+		}
+		return nil
+	}
+	type weighted struct {
+		other string
+		w     float64
+	}
+	neighbours := make(map[string][]weighted, len(selectedIDs))
+	for i := 0; i < len(selectedIDs); i++ {
+		vi := nodeVec(selectedIDs[i])
+		if vi == nil {
+			continue
+		}
+		for j := i + 1; j < len(selectedIDs); j++ {
+			vj := nodeVec(selectedIDs[j])
+			if vj == nil {
+				continue
+			}
+			sim := cosineSim(vi, vj)
+			if sim < threshold {
+				continue
+			}
+			neighbours[selectedIDs[i]] = append(neighbours[selectedIDs[i]], weighted{other: selectedIDs[j], w: sim})
+			neighbours[selectedIDs[j]] = append(neighbours[selectedIDs[j]], weighted{other: selectedIDs[i], w: sim})
+		}
+	}
+	type edgeKey struct{ lo, hi string }
+	keep := make(map[edgeKey]float64)
+	for nodeID, ws := range neighbours {
+		sort.Slice(ws, func(i, j int) bool { return ws[i].w > ws[j].w })
+		limit := min(topK, len(ws))
+		for i := 0; i < limit; i++ {
+			lo, hi := nodeID, ws[i].other
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			keep[edgeKey{lo, hi}] = ws[i].w
+		}
+	}
+	edges := make([]Edge, 0, len(keep))
+	for k, w := range keep {
+		edges = append(edges, Edge{Source: k.lo, Target: k.hi, Kind: EdgeSimilarity, Weight: w})
+	}
+	if b.Logger != nil {
+		b.Logger.Info("embedder: similarity edges", "queried", len(allQueries), "received", len(embsByQuery), "edges", len(edges), "threshold", threshold, "topK", topK)
+	}
+	return edges
+}
+
+// cosineSim returns the cosine of the angle between a and b. Returns 0
+// when either vector is empty or zero — caller treats below-threshold
+// values as no-edge, so a 0 just means "skip".
+func cosineSim(a, b []float32) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, magA, magB float64
+	for i, av := range a {
+		bv := b[i]
+		dot += float64(av) * float64(bv)
+		magA += float64(av) * float64(av)
+		magB += float64(bv) * float64(bv)
+	}
+	if magA == 0 || magB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(magA) * math.Sqrt(magB))
+}
+
+// s2RecommendID builds a S2-recommendable id from the seed's external ids.
+// S2's /recommendations/v1/papers/forpaper/{id} accepts DOI: and ARXIV:
+// prefixes alongside hex paperIds, so we don't need to resolve to S2's
+// hex id first. Returns "" when no usable id is present.
+func s2RecommendID(seed *citation.Paper) string {
+	if doi := strings.TrimSpace(seed.ExternalIDs["DOI"]); doi != "" {
+		return "DOI:" + doi
+	}
+	if a := strings.TrimSpace(seed.ExternalIDs["ArXiv"]); a != "" {
+		return "ARXIV:" + a
+	}
+	return ""
 }
 
 // fetchSeed tries the cache first (requires refs/cites to be persisted)

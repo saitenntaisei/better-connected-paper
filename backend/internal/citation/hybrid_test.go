@@ -13,8 +13,10 @@ type stubProvider struct {
 	search     func(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error)
 	getPaper   func(ctx context.Context, id string, fields []string) (*Paper, error)
 	getBatch   func(ctx context.Context, ids []string, fields []string) ([]Paper, error)
+	recommend  func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
 	calls      []stubCall
 	batchCalls []stubBatchCall
+	recCalls   []stubCall
 }
 
 type stubCall struct {
@@ -42,6 +44,15 @@ func (s *stubProvider) GetPaper(ctx context.Context, id string, fields []string)
 func (s *stubProvider) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
 	s.batchCalls = append(s.batchCalls, stubBatchCall{ids: ids, fields: fields})
 	return s.getBatch(ctx, ids, fields)
+}
+
+// Recommend lets stubProvider double as a Recommender for tests that wire
+// it as ResolvingTertiary.Inner. Methods without a wired func surface a
+// nil-deref so the test fails loudly if the code under test calls Recommend
+// when it shouldn't.
+func (s *stubProvider) Recommend(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+	s.recCalls = append(s.recCalls, stubCall{id: id, fields: fields})
+	return s.recommend(ctx, id, limit, fields)
 }
 
 func TestHybridSearchAlwaysPrimary(t *testing.T) {
@@ -751,6 +762,90 @@ func TestResolvingTertiaryDoesNotSupplementWhenLimitZero(t *testing.T) {
 	if len(inner.citerCalls) != 0 {
 		t.Fatalf("expected no paginated calls, got %d", len(inner.citerCalls))
 	}
+}
+
+func TestResolvingTertiaryRecommendTranslatesArxivAndDOIs(t *testing.T) {
+	// S2 recommendations come back in S2 paperId space with ArXiv (and
+	// sometimes DOI) externalIds. The tertiary must translate both into
+	// primary-space W-IDs by synthesising 10.48550/arxiv.<id> when the rec
+	// only has an ArXiv id, and dropping recs that have neither.
+	inner := &stubProvider{
+		recommend: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+			return []Paper{
+				{PaperID: "rec_doi", ExternalIDs: ExternalIDs{"DOI": "10.1/explicit"}},
+				{PaperID: "rec_arxiv_only", ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
+				{PaperID: "rec_arxiv_upper", ExternalIDs: ExternalIDs{"ArXiv": "2511.99002", "DOI": ""}}, // empty DOI shouldn't suppress arxiv synthesis
+				{PaperID: "rec_neither"}, // dropped
+			}, nil
+		},
+	}
+	var resolved [][]string
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		resolved = append(resolved, append([]string(nil), dois...))
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver}
+	got, err := r.Recommend(context.Background(), "SEED_HEX", 10, []string{"paperId", "title"})
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 translated recs, got %d: %+v", len(got), got)
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("want exactly 1 resolver call (batched), got %d: %v", len(resolved), resolved)
+	}
+	doiSet := map[string]bool{}
+	for _, d := range resolved[0] {
+		doiSet[d] = true
+	}
+	if !doiSet["10.1/explicit"] || !doiSet["10.48550/arxiv.2511.99001"] || !doiSet["10.48550/arxiv.2511.99002"] {
+		t.Errorf("missing expected DOIs in resolver call: %v", resolved[0])
+	}
+}
+
+func TestResolvingTertiaryRecommendNilOnNonRecommenderInner(t *testing.T) {
+	// The Inner must implement Recommender for tertiary to forward calls. A
+	// plain PaperProvider stub (no recommend func) should yield nil/empty so
+	// the builder's fallback can short-circuit gracefully.
+	inner := &stubProvider{} // no recommend func wired
+	type onlyPaperProvider interface {
+		Search(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error)
+		GetPaper(ctx context.Context, id string, fields []string) (*Paper, error)
+		GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error)
+	}
+	// Compile-time check that stubProvider satisfies the narrow interface;
+	// the assertion at runtime in tertiary should not depend on this.
+	var _ onlyPaperProvider = inner
+
+	r := &ResolvingTertiary{Inner: paperProviderOnly{inner}}
+	got, err := r.Recommend(context.Background(), "SEED", 10, nil)
+	if err != nil {
+		t.Fatalf("recommend on non-Recommender inner: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("want empty, got %d recs", len(got))
+	}
+}
+
+// paperProviderOnly hides the embedded stubProvider's Recommend method so
+// the type assertion to Recommender inside ResolvingTertiary.Recommend
+// fails — modeling a real PaperProvider that lacks recommendations support.
+type paperProviderOnly struct{ p PaperProvider }
+
+func (p paperProviderOnly) Search(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error) {
+	return p.p.Search(ctx, q, limit, fields)
+}
+func (p paperProviderOnly) GetPaper(ctx context.Context, id string, fields []string) (*Paper, error) {
+	return p.p.GetPaper(ctx, id, fields)
+}
+func (p paperProviderOnly) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+	return p.p.GetPaperBatch(ctx, ids, fields)
 }
 
 func TestResolvingTertiaryBatchTranslatesRefs(t *testing.T) {

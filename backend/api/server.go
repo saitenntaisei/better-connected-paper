@@ -55,8 +55,8 @@ func initHandler() {
 		}
 	}
 
-	paperClient := newPaperClient()
-	builder := &graph.Builder{S2: paperClient, Cache: graphCache(db)}
+	paperClient, recommender, embedder := newPaperClient()
+	builder := &graph.Builder{S2: paperClient, Cache: graphCache(db), Recommender: recommender, Embedder: embedder}
 	handler = api.NewRouter(api.Deps{S2: paperClient, DB: db, Builder: builder})
 }
 
@@ -67,32 +67,41 @@ type paperClient interface {
 	api.PaperClient
 }
 
-func newPaperClient() paperClient {
+func newPaperClient() (paperClient, citation.Recommender, citation.Embedder) {
 	provider := strings.ToLower(strings.TrimSpace(os.Getenv("CITATION_PROVIDER")))
 	switch provider {
 	case "semanticscholar", "s2":
 		log.Printf("init: citation provider = semanticscholar")
-		return citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
+		c := citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")})
+		return c, c, c
 	case "openalex":
 		log.Printf("init: citation provider = openalex")
-		return citation.NewOpenAlex(citation.OpenAlexOptions{Mailto: os.Getenv("OPENALEX_EMAIL")})
+		return citation.NewOpenAlex(citation.OpenAlexOptions{Mailto: os.Getenv("OPENALEX_EMAIL")}), nil, nil
 	default:
-		// Hybrid: OpenAlex primary + OpenCitations secondary. S2 is no longer
-		// wired by default — its 1 req / 3 s anonymous rate limit caused
-		// 429 cascades on every cold build. Set CITATION_TERTIARY=semanticscholar
-		// to opt it back in when an API key raises that ceiling.
+		// Hybrid: OpenAlex primary + OpenCitations secondary, plus S2 tertiary
+		// when a key is present (auto-enabled in vercelHybridTertiary). The
+		// tertiary doubles as the Builder's Recommender + Embedder so sparse
+		// seeds like brand-new arxiv preprints get the same /recommendations
+		// + embedding-similarity wiring Connected Papers uses.
 		primary := citation.NewOpenAlex(citation.OpenAlexOptions{Mailto: os.Getenv("OPENALEX_EMAIL")})
 		if strings.EqualFold(os.Getenv("CITATION_HYBRID"), "false") {
 			log.Printf("init: citation provider = openalex (hybrid disabled)")
-			return primary
+			return primary, nil, nil
 		}
 		secondary := vercelHybridSecondary(primary)
 		tertiary := vercelHybridTertiary(primary, secondary)
 		if secondary == nil && tertiary == nil {
 			log.Printf("init: citation provider = openalex (hybrid disabled; no supplement configured)")
-			return primary
+			return primary, nil, nil
 		}
-		return &citation.HybridClient{Primary: primary, Secondary: secondary, Tertiary: tertiary}
+		hc := &citation.HybridClient{Primary: primary, Secondary: secondary, Tertiary: tertiary}
+		var rec citation.Recommender
+		var emb citation.Embedder
+		if tertiary != nil {
+			rec = tertiary
+			emb = tertiary
+		}
+		return hc, rec, emb
 	}
 }
 
@@ -116,11 +125,16 @@ func vercelHybridSecondary(primary *citation.OpenAlexClient) citation.PaperProvi
 	}
 }
 
-// vercelHybridTertiary mirrors cmd/server.newHybridTertiary. Default is
-// nil — S2 is no longer auto-enabled. Opt-in with CITATION_TERTIARY=
-// semanticscholar when an API key is available.
-func vercelHybridTertiary(primary *citation.OpenAlexClient, secondary citation.PaperProvider) citation.PaperProvider {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITATION_TERTIARY"))) {
+// vercelHybridTertiary mirrors cmd/server.newHybridTertiary. Auto-promotes
+// to S2 whenever SEMANTIC_SCHOLAR_API_KEY is set so the recs endpoint is
+// available for sparse seeds; without a key the default stays nil.
+func vercelHybridTertiary(primary *citation.OpenAlexClient, secondary citation.PaperProvider) *citation.ResolvingTertiary {
+	sel := strings.ToLower(strings.TrimSpace(os.Getenv("CITATION_TERTIARY")))
+	if sel == "" && os.Getenv("SEMANTIC_SCHOLAR_API_KEY") != "" {
+		sel = "semanticscholar"
+		log.Printf("init: citation tertiary auto-enabled = semanticscholar (api key present)")
+	}
+	switch sel {
 	case "semanticscholar", "s2":
 		if _, isS2 := secondary.(*citation.Client); isS2 {
 			return nil
