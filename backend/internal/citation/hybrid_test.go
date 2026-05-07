@@ -3,6 +3,7 @@ package citation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -733,6 +734,41 @@ func TestResolvingTertiarySkipsPaginatedRefsWhenInlinePresent(t *testing.T) {
 	}
 	if len(inner.refCalls) != 0 {
 		t.Fatalf("expected 0 paginated calls, got %d", len(inner.refCalls))
+	}
+}
+
+// A wide first-hop with all-empty inline refs should not trigger more
+// than refsBackfillBudgetPerBatch paginated /references calls — otherwise
+// a 30+ paper batch at 1 RPS keyed would blow past the Vercel function
+// cap. Excess papers fall through with empty refs (logged once).
+func TestResolvingTertiaryBatchCapsPaginatedRefsFallback(t *testing.T) {
+	const inputs = refsBackfillBudgetPerBatch + 5
+	ids := make([]string, inputs)
+	stubPapers := make([]Paper, inputs)
+	for i := 0; i < inputs; i++ {
+		ids[i] = fmt.Sprintf("hex%d", i)
+		stubPapers[i] = Paper{PaperID: ids[i]} // empty References
+	}
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+			return stubPapers, nil
+		}},
+		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/" + id}}}, nil
+		},
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}}
+	if _, err := r.GetPaperBatch(context.Background(), ids, []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(inner.refCalls); got != refsBackfillBudgetPerBatch {
+		t.Errorf("paginated /references calls: got %d, want %d (budget cap)", got, refsBackfillBudgetPerBatch)
 	}
 }
 
