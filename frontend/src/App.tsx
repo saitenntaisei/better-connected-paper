@@ -17,7 +17,31 @@ export default function App() {
   const { seed: urlSeed, setSeed: setUrlSeed, hasPushedEntry } = useUrlSeed();
 
   const [focusId, setFocusId] = useState<string | null>(urlSeed);
+  // edgeMode is the user's preferred edge layer. effectiveEdgeMode below
+  // overrides it when the active graph has no edges of that kind — a
+  // sparse arxiv seed whose neighbourhood is similarity-only would
+  // otherwise render as just the seed dot under the default "cite".
   const [edgeMode, setEdgeMode] = useState<EdgeMode>("cite");
+
+  const edgeCounts = useMemo(() => {
+    if (graphState.status !== "success") return { cite: 0, similarity: 0 };
+    const c = { cite: 0, similarity: 0 };
+    for (const e of graphState.data.edges) {
+      if (e.kind === "cite") c.cite++;
+      else if (e.kind === "similarity") c.similarity++;
+    }
+    return c;
+  }, [graphState]);
+
+  const effectiveEdgeMode = useMemo<EdgeMode>(() => {
+    if (edgeMode === "cite" && edgeCounts.cite === 0 && edgeCounts.similarity > 0) {
+      return "similarity";
+    }
+    if (edgeMode === "similarity" && edgeCounts.similarity === 0 && edgeCounts.cite > 0) {
+      return "cite";
+    }
+    return edgeMode;
+  }, [edgeMode, edgeCounts]);
 
   // Reset the detail-panel focus whenever the seed changes — including the
   // popstate case, which updates urlSeed without going through selectSeed.
@@ -79,20 +103,26 @@ export default function App() {
             <button
               type="button"
               role="radio"
-              aria-checked={edgeMode === "cite"}
-              className={edgeMode === "cite" ? "is-active" : undefined}
+              aria-checked={effectiveEdgeMode === "cite"}
+              aria-label={`Citations (${edgeCounts.cite})`}
+              className={effectiveEdgeMode === "cite" ? "is-active" : undefined}
+              disabled={edgeCounts.cite === 0}
               onClick={() => setEdgeMode("cite")}
             >
               Citations
+              <span className="edge-mode-count">{edgeCounts.cite}</span>
             </button>
             <button
               type="button"
               role="radio"
-              aria-checked={edgeMode === "similarity"}
-              className={edgeMode === "similarity" ? "is-active" : undefined}
+              aria-checked={effectiveEdgeMode === "similarity"}
+              aria-label={`Similarity (${edgeCounts.similarity})`}
+              className={effectiveEdgeMode === "similarity" ? "is-active" : undefined}
+              disabled={edgeCounts.similarity === 0}
               onClick={() => setEdgeMode("similarity")}
             >
               Similarity
+              <span className="edge-mode-count">{edgeCounts.similarity}</span>
             </button>
           </div>
         </div>
@@ -115,7 +145,7 @@ export default function App() {
               <Graph
                 data={graphState.data}
                 onSelectNode={setFocusId}
-                edgeMode={edgeMode}
+                edgeMode={effectiveEdgeMode}
               />
             )}
           </div>

@@ -940,6 +940,22 @@ button {
   color: var(--card);
 }
 
+.edge-mode-toggle button[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.edge-mode-toggle .edge-mode-count {
+  margin-left: 0.5rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+}
+
+.edge-mode-toggle button.is-active .edge-mode-count {
+  opacity: 1;
+}
+
 /* ========================================================
    Colophon / footer
    ======================================================== */
