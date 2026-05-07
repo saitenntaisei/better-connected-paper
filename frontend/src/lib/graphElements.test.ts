@@ -16,32 +16,29 @@ const sample: GraphResponse = {
 };
 
 describe("toElements", () => {
-  it("maps nodes and directed citation edges to cytoscape elements", () => {
+  it("defaults to cite mode and maps directed citation edges only", () => {
     const { elements, yearRange } = toElements(sample);
     expect(yearRange).toEqual([2010, 2017]);
     const nodes = elements.filter((e) => e.group === "nodes");
     const edges = elements.filter((e) => e.group === "edges");
     expect(nodes).toHaveLength(2);
-    expect(edges).toHaveLength(2);
+    expect(edges).toHaveLength(1);
+    expect(edges[0].classes).toBe("cite");
 
     const seed = nodes.find((n) => n.data.id === "S")!;
     expect(seed.classes).toBe("seed");
     expect(seed.data.isSeed).toBe(true);
-
-    const cite = edges.find((e) => e.classes === "cite")!;
-    expect(cite.data).toMatchObject({ source: "S", target: "A", kind: "cite" });
-    const sim = edges.find((e) => e.classes === "similarity")!;
-    expect(sim.data.kind).toBe("similarity");
   });
 
-  it("drops similarity edges when includeSimilarity is false", () => {
-    const { elements } = toElements(sample, { includeSimilarity: false });
+  it("emits only similarity edges when edgeMode is similarity", () => {
+    const { elements } = toElements(sample, { edgeMode: "similarity" });
     const edges = elements.filter((e) => e.group === "edges");
     expect(edges).toHaveLength(1);
-    expect(edges[0].classes).toBe("cite");
+    expect(edges[0].classes).toBe("similarity");
+    expect(edges[0].data).toMatchObject({ source: "A", target: "S", kind: "similarity" });
   });
 
-  it("drops nodes with no cite edges when includeSimilarity is false", () => {
+  it("drops nodes that have no edges of the selected kind (cite mode)", () => {
     const graph: GraphResponse = {
       seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
       nodes: [
@@ -55,12 +52,31 @@ describe("toElements", () => {
       ],
       builtAt: "2026-04-19T00:00:00Z",
     };
-    const { elements } = toElements(graph, { includeSimilarity: false });
+    const { elements } = toElements(graph, { edgeMode: "cite" });
     const nodeIds = elements.filter((e) => e.group === "nodes").map((e) => e.data.id);
     expect(nodeIds.sort()).toEqual(["A", "S"]);
   });
 
-  it("keeps seed even when it has no cite edges under includeSimilarity false", () => {
+  it("drops nodes that have no edges of the selected kind (similarity mode)", () => {
+    const graph: GraphResponse = {
+      seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
+      nodes: [
+        { id: "S", title: "Seed", year: 2020, similarity: 0, isSeed: true, citationCount: 10 },
+        { id: "A", title: "Cites S only", year: 2021, similarity: 0.6, citationCount: 5 },
+        { id: "B", title: "Similar to S", year: 2022, similarity: 0.5, citationCount: 3 },
+      ],
+      edges: [
+        { source: "A", target: "S", kind: "cite", weight: 1 },
+        { source: "B", target: "S", kind: "similarity", weight: 0.4 },
+      ],
+      builtAt: "2026-04-19T00:00:00Z",
+    };
+    const { elements } = toElements(graph, { edgeMode: "similarity" });
+    const nodeIds = elements.filter((e) => e.group === "nodes").map((e) => e.data.id);
+    expect(nodeIds.sort()).toEqual(["B", "S"]);
+  });
+
+  it("keeps the seed even when it has no edges of the selected kind", () => {
     const graph: GraphResponse = {
       seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
       nodes: [
@@ -71,7 +87,7 @@ describe("toElements", () => {
       edges: [{ source: "A", target: "B", kind: "cite", weight: 1 }],
       builtAt: "2026-04-19T00:00:00Z",
     };
-    const { elements } = toElements(graph, { includeSimilarity: false });
+    const { elements } = toElements(graph, { edgeMode: "cite" });
     const nodeIds = elements.filter((e) => e.group === "nodes").map((e) => e.data.id);
     expect(nodeIds.sort()).toEqual(["A", "B", "S"]);
   });

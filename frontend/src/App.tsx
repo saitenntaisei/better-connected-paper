@@ -8,6 +8,7 @@ import { Spinner } from "./components/Spinner";
 import { useSearch } from "./hooks/useSearch";
 import { useGraph } from "./hooks/useGraph";
 import { useUrlSeed } from "./hooks/useUrlSeed";
+import type { EdgeMode } from "./lib/graphElements";
 import type { SearchResult } from "./types/api";
 
 export default function App() {
@@ -16,7 +17,7 @@ export default function App() {
   const { seed: urlSeed, setSeed: setUrlSeed, hasPushedEntry } = useUrlSeed();
 
   const [focusId, setFocusId] = useState<string | null>(urlSeed);
-  const [showSimilarity, setShowSimilarity] = useState(true);
+  const [edgeMode, setEdgeMode] = useState<EdgeMode>("cite");
 
   // Reset the detail-panel focus whenever the seed changes — including the
   // popstate case, which updates urlSeed without going through selectSeed.
@@ -74,14 +75,26 @@ export default function App() {
             <span className="eyebrow">Citation graph ·</span>
             <span className="seed-title">{seedTitle}</span>
           </h2>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={showSimilarity}
-              onChange={(e) => setShowSimilarity(e.target.checked)}
-            />
-            Show similarity links
-          </label>
+          <div className="edge-mode-toggle" role="radiogroup" aria-label="Edge type">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={edgeMode === "cite"}
+              className={edgeMode === "cite" ? "is-active" : undefined}
+              onClick={() => setEdgeMode("cite")}
+            >
+              Citations
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={edgeMode === "similarity"}
+              className={edgeMode === "similarity" ? "is-active" : undefined}
+              onClick={() => setEdgeMode("similarity")}
+            >
+              Similarity
+            </button>
+          </div>
         </div>
         <div className="graph-page-body">
           <div className="graph-main">
@@ -102,7 +115,7 @@ export default function App() {
               <Graph
                 data={graphState.data}
                 onSelectNode={setFocusId}
-                showSimilarity={showSimilarity}
+                edgeMode={edgeMode}
               />
             )}
           </div>

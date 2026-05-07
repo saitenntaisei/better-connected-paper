@@ -3,6 +3,7 @@ import cytoscape from "cytoscape";
 import type { Core } from "cytoscape";
 import coseBilkent from "cytoscape-cose-bilkent";
 import { toElements } from "../lib/graphElements";
+import type { EdgeMode } from "../lib/graphElements";
 import { graphStylesheet } from "../lib/cytoscapeStyles";
 import type { GraphResponse } from "../types/api";
 
@@ -16,10 +17,10 @@ function ensureRegistered() {
 type Props = {
   data: GraphResponse;
   onSelectNode?: (id: string) => void;
-  showSimilarity?: boolean;
+  edgeMode?: EdgeMode;
 };
 
-export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
+export function Graph({ data, onSelectNode, edgeMode = "cite" }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
 
@@ -27,7 +28,7 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
     ensureRegistered();
     if (!containerRef.current) return;
 
-    const { elements } = toElements(data, { includeSimilarity: showSimilarity });
+    const { elements } = toElements(data, { edgeMode });
     const cy = cytoscape({
       container: containerRef.current,
       elements,
@@ -91,7 +92,7 @@ export function Graph({ data, onSelectNode, showSimilarity = true }: Props) {
       cy.destroy();
       cyRef.current = null;
     };
-  }, [data, onSelectNode, showSimilarity]);
+  }, [data, onSelectNode, edgeMode]);
 
   return (
     <div
