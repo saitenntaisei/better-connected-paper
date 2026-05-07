@@ -648,6 +648,94 @@ func TestResolvingTertiaryDoesNotEnrichWhenCallerDidNotAsk(t *testing.T) {
 	}
 }
 
+// stubRefLister is a stubProvider that also satisfies referenceLister so
+// tests can wire ResolvingTertiary's paginated /references fallback.
+type stubRefLister struct {
+	stubProvider
+	refs     func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
+	refCalls []refCall
+}
+
+type refCall struct {
+	id    string
+	limit int
+}
+
+func (s *stubRefLister) GetReferences(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+	s.refCalls = append(s.refCalls, refCall{id: id, limit: limit})
+	if s.refs == nil {
+		return nil, nil
+	}
+	return s.refs(ctx, id, limit, fields)
+}
+
+func TestResolvingTertiaryFallsBackToPaginatedRefsWhenInlineEmpty(t *testing.T) {
+	// AsyncVLA-style: S2's /paper response has zero inline refs (the field
+	// isn't populated for many recent arxiv preprints), but the paginated
+	// /paper/{id}/references endpoint does return refs. The tertiary must
+	// notice the empty inline result and fall back to the paginated call,
+	// then translate the cited papers into primary-space W-IDs.
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:    "S2HEX",
+				References: nil, // inline empty
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+			return []Paper{
+				{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}},
+				{ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
+			}, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver}
+
+	p, err := r.GetPaper(context.Background(), "ARXIV:2511.14148", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.refCalls) != 1 {
+		t.Fatalf("paginated /references must be called once when inline empty, got %d", len(inner.refCalls))
+	}
+	if len(p.References) != 2 {
+		t.Fatalf("want 2 translated refs (DOI + arxiv-synthesised), got %d: %+v", len(p.References), p.References)
+	}
+}
+
+func TestResolvingTertiarySkipsPaginatedRefsWhenInlinePresent(t *testing.T) {
+	// Inline already populated → no need to pay for an extra paginated call.
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:    "S2HEX",
+				References: []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}}},
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+			t.Fatalf("paginated /references must not fire when inline refs already populated")
+			return nil, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		return []Paper{{PaperID: "W_x"}}, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver}
+	if _, err := r.GetPaper(context.Background(), "ARXIV:Y", []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.refCalls) != 0 {
+		t.Fatalf("expected 0 paginated calls, got %d", len(inner.refCalls))
+	}
+}
+
 // stubCiterProvider is a stubProvider that also satisfies citerLister.
 type stubCiterProvider struct {
 	stubProvider

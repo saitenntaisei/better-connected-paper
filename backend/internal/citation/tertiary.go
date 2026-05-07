@@ -41,6 +41,14 @@ type citerLister interface {
 	GetCitationsFrom(ctx context.Context, id string, offset, limit int, fields []string) ([]Paper, error)
 }
 
+// referenceLister lets the tertiary fall back to S2's paginated
+// /paper/{id}/references endpoint when the inline `references` field
+// returned empty — a common shape for recent arxiv preprints whose
+// metadata extraction has not finished propagating to the inline path.
+type referenceLister interface {
+	GetReferences(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
+}
+
 // Search passes through; hybrid uses its result only to grab a hit.PaperID
 // which then flows back into GetPaper, where translation happens.
 func (r *ResolvingTertiary) Search(ctx context.Context, query string, limit int, fields []string) (*SearchResponse, error) {
@@ -61,6 +69,7 @@ func (r *ResolvingTertiary) GetPaper(ctx context.Context, id string, fields []st
 		return p, err
 	}
 	r.supplementCiters(ctx, id, p)
+	r.supplementRefsViaPagination(ctx, id, p, fields)
 	if refs := r.translate(ctx, p.References); refs != nil {
 		p.References = refs
 		if p.ReferenceCount < len(refs) {
@@ -139,6 +148,13 @@ func (r *ResolvingTertiary) supplementCiters(ctx context.Context, id string, p *
 // candidates off refs and the seed's citers, so skipping cites here keeps
 // the batch cost bounded. Top-level ExternalIDs is preserved so callers can
 // match returned papers back to their input DOIs.
+//
+// Papers whose inline refs came back empty get a per-paper paginated
+// /references fallback (same shape as GetPaper) so the batch doesn't
+// regress on the recent-arxiv preprint shape that motivated the
+// fallback in the first place. This is N extra HTTP calls — one per
+// empty-refs entry — but is the only way given S2 has no paginated
+// references endpoint at the batch level.
 func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
 	if r.Inner == nil {
 		return nil, nil
@@ -146,6 +162,18 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 	papers, err := r.Inner.GetPaperBatch(ctx, ids, enrichTertiaryFields(fields))
 	if err != nil || len(papers) == 0 {
 		return papers, err
+	}
+	if requestsReferences(fields) {
+		for i := range papers {
+			if len(papers[i].References) > 0 {
+				continue
+			}
+			id := papers[i].PaperID
+			if id == "" {
+				continue
+			}
+			r.supplementRefsViaPagination(ctx, id, &papers[i], fields)
+		}
 	}
 	r.translateRefsBatch(ctx, papers)
 	for i := range papers {
@@ -169,7 +197,7 @@ func (r *ResolvingTertiary) translateRefsBatch(ctx context.Context, papers []Pap
 	doiSet := make(map[string]struct{})
 	for i := range papers {
 		for j := range papers[i].References {
-			d := strings.ToLower(strings.TrimSpace(papers[i].References[j].ExternalIDs["DOI"]))
+			d := canonicalDOIFromExternalIDs(papers[i].References[j].ExternalIDs)
 			if d == "" {
 				continue
 			}
@@ -211,7 +239,7 @@ func (r *ResolvingTertiary) translateRefsBatch(ctx context.Context, papers []Pap
 		translated := make([]Paper, 0, len(papers[i].References))
 		seen := make(map[string]struct{}, len(papers[i].References))
 		for _, ref := range papers[i].References {
-			d := strings.ToLower(strings.TrimSpace(ref.ExternalIDs["DOI"]))
+			d := canonicalDOIFromExternalIDs(ref.ExternalIDs)
 			if d == "" {
 				continue
 			}
@@ -284,6 +312,44 @@ func (r *ResolvingTertiary) Recommend(ctx context.Context, id string, limit int,
 	return resolved, nil
 }
 
+// supplementRefsViaPagination fills p.References from S2's paginated
+// /paper/{id}/references endpoint when the inline response came back
+// empty but the caller asked for refs. The inline `references` field is
+// often blank for recent arxiv preprints (AsyncVLA's recs are the
+// canonical case) while the paginated endpoint still returns 30-100
+// citedPaper entries — without this fallback, biblio coupling among
+// the recs cluster collapses to 0 and the cite arrows go missing.
+func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id string, p *Paper, fields []string) {
+	if p == nil || len(p.References) > 0 || !requestsReferences(fields) {
+		return
+	}
+	lister, ok := r.Inner.(referenceLister)
+	if !ok {
+		return
+	}
+	refs, err := lister.GetReferences(ctx, id, 200, []string{"paperId", "externalIds"})
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("tertiary: paginated refs supplement failed", "id", id, "err", err)
+		}
+		return
+	}
+	if len(refs) == 0 {
+		// No log: S2 routinely returns 0 for new arxiv preprints whose
+		// venues (AAAI etc.) have elided the references field via
+		// publisher embargo. Logging every miss would dominate log volume
+		// for sparse-seed builds.
+		return
+	}
+	p.References = refs
+	if p.ReferenceCount < len(refs) {
+		p.ReferenceCount = len(refs)
+	}
+	if r.Logger != nil {
+		r.Logger.Info("tertiary: paginated refs supplement", "id", id, "added", len(refs))
+	}
+}
+
 // EmbeddingsByExternalID delegates to the inner provider when it implements
 // Embedder (the S2 client does). The tertiary doesn't translate IDs here:
 // callers key embeddings by DOI directly, so no W-ID resolution is needed.
@@ -335,10 +401,11 @@ func enrichRecommendFields(fields []string) []string {
 }
 
 // translate collects DOIs from the items' externalIds and resolves them
-// to W-ID Papers via the injected resolver. Items without DOIs are
-// dropped — the builder only needs PaperIDs, and an un-resolvable ref
-// can't contribute to the graph anyway. Returns nil when nothing
-// resolved (caller treats nil as "clear the field").
+// to W-ID Papers via the injected resolver. Arxiv-only items get a
+// synthesised 10.48550/arxiv.<id> DOI so the paginated /references
+// fallback (which surfaces arxiv-only entries from S2) doesn't lose
+// them. Items with neither identifier are dropped. Returns nil when
+// nothing resolved (caller treats nil as "clear the field").
 func (r *ResolvingTertiary) translate(ctx context.Context, items []Paper) []Paper {
 	if len(items) == 0 || r.Resolver == nil {
 		return nil
@@ -346,11 +413,10 @@ func (r *ResolvingTertiary) translate(ctx context.Context, items []Paper) []Pape
 	dois := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))
 	for i := range items {
-		d := strings.TrimSpace(items[i].ExternalIDs["DOI"])
+		d := canonicalDOIFromExternalIDs(items[i].ExternalIDs)
 		if d == "" {
 			continue
 		}
-		d = strings.ToLower(d)
 		if _, dup := seen[d]; dup {
 			continue
 		}
