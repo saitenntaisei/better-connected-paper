@@ -576,10 +576,14 @@ func cosineSim(a, b []float32) float64 {
 	return dot / (math.Sqrt(magA) * math.Sqrt(magB))
 }
 
-// s2RecommendID builds a S2-recommendable id from the seed's external ids.
-// S2's /recommendations/v1/papers/forpaper/{id} accepts DOI: and ARXIV:
-// prefixes alongside hex paperIds, so we don't need to resolve to S2's
-// hex id first. Returns "" when no usable id is present.
+// s2RecommendID builds a S2-recommendable id from the seed. S2's
+// /recommendations/v1/papers/forpaper/{id} accepts DOI: / ARXIV: prefixes
+// alongside the bare 40-char hex paperId, so we try those external ids
+// first and fall back to seed.PaperID when it already looks like an S2
+// hex — under CITATION_PROVIDER=semanticscholar the seed comes back from
+// S2 directly, sometimes without any DOI/ArXiv metadata, and sparse-seed
+// recommendations would otherwise silently no-op. Returns "" when no
+// usable id is present.
 func s2RecommendID(seed *citation.Paper) string {
 	if doi := strings.TrimSpace(seed.ExternalIDs["DOI"]); doi != "" {
 		return "DOI:" + doi
@@ -587,7 +591,26 @@ func s2RecommendID(seed *citation.Paper) string {
 	if a := strings.TrimSpace(seed.ExternalIDs["ArXiv"]); a != "" {
 		return "ARXIV:" + a
 	}
+	if isS2HexPaperID(seed.PaperID) {
+		return seed.PaperID
+	}
 	return ""
+}
+
+// isS2HexPaperID reports whether id is a 40-character lowercase-hex
+// string — the canonical Semantic Scholar paperId shape. We avoid using
+// it on OpenAlex W-IDs (which start with "W") so the hybrid path doesn't
+// mistakenly send a non-S2 id to /recommendations.
+func isS2HexPaperID(id string) bool {
+	if len(id) != 40 {
+		return false
+	}
+	for _, c := range id {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // fetchSeed tries the cache first (requires refs/cites to be persisted)

@@ -504,6 +504,42 @@ func TestBuildSkipsRecommenderWhenSeedHasNoLookupID(t *testing.T) {
 	}
 }
 
+// Under CITATION_PROVIDER=semanticscholar the seed paper comes back with
+// only its 40-char hex paperId — no DOI/ArXiv populated. Without a hex
+// fallback the recommender lookup is skipped and the build collapses to
+// the plain 4-node graph the recs path was meant to escape.
+func TestBuildAugmentsSparseSeedViaHexPaperID(t *testing.T) {
+	const hexSeed = "abcdef0123456789abcdef0123456789abcdef01"
+	s2 := &stubS2{papers: map[string]citation.Paper{
+		hexSeed: {PaperID: hexSeed, Title: "Sparse S2 Seed", Year: 2025},
+		"REC1":  paper("REC1", []string{hexSeed}, nil),
+	}}
+	rec := &recStub{
+		fn: func(ctx context.Context, id string, limit int, fields []string) ([]citation.Paper, error) {
+			return []citation.Paper{{PaperID: "REC1"}}, nil
+		},
+	}
+	b := &Builder{S2: s2, Recommender: rec, MaxNodes: 10, SimilarityEdgeThreshold: 0.0001}
+
+	resp, err := b.Build(context.Background(), hexSeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("want 1 recommender call for hex-only sparse seed, got %d", len(rec.calls))
+	}
+	if rec.calls[0].id != hexSeed {
+		t.Errorf("recommender lookup id: got %q, want raw hex %q", rec.calls[0].id, hexSeed)
+	}
+	have := map[string]bool{}
+	for _, n := range resp.Nodes {
+		have[n.ID] = true
+	}
+	if !have["REC1"] {
+		t.Errorf("rec REC1 was not surfaced; nodes=%v", have)
+	}
+}
+
 func TestBuildRespectsMaxNodes(t *testing.T) {
 	refs := []string{}
 	papers := map[string]citation.Paper{}
