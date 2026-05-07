@@ -649,25 +649,24 @@ func TestResolvingTertiaryDoesNotEnrichWhenCallerDidNotAsk(t *testing.T) {
 	}
 }
 
-// stubRefLister is a stubProvider that also satisfies referenceLister so
-// tests can wire ResolvingTertiary's paginated /references fallback.
+// stubRefLister is a stubProvider that also satisfies referencePager so
+// tests can wire ResolvingTertiary's single-page /references fallback.
 type stubRefLister struct {
 	stubProvider
-	refs     func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
+	refs     func(ctx context.Context, id string, fields []string) ([]Paper, error)
 	refCalls []refCall
 }
 
 type refCall struct {
-	id    string
-	limit int
+	id string
 }
 
-func (s *stubRefLister) GetReferences(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
-	s.refCalls = append(s.refCalls, refCall{id: id, limit: limit})
+func (s *stubRefLister) GetReferencesSinglePage(ctx context.Context, id string, fields []string) ([]Paper, error) {
+	s.refCalls = append(s.refCalls, refCall{id: id})
 	if s.refs == nil {
 		return nil, nil
 	}
-	return s.refs(ctx, id, limit, fields)
+	return s.refs(ctx, id, fields)
 }
 
 func TestResolvingTertiaryFallsBackToPaginatedRefsWhenInlineEmpty(t *testing.T) {
@@ -683,7 +682,7 @@ func TestResolvingTertiaryFallsBackToPaginatedRefsWhenInlineEmpty(t *testing.T) 
 				References: nil, // inline empty
 			}, nil
 		}},
-		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
 			return []Paper{
 				{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}},
 				{ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
@@ -703,14 +702,10 @@ func TestResolvingTertiaryFallsBackToPaginatedRefsWhenInlineEmpty(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Exactly one HTTP request: the single-page interface guarantees
+	// listPapers' auto-pagination can't double-spend the per-build budget.
 	if len(inner.refCalls) != 1 {
 		t.Fatalf("paginated /references must be called once when inline empty, got %d", len(inner.refCalls))
-	}
-	// Limit must be ≤100 so listPapers issues a single HTTP request per
-	// fallback — otherwise one budget unit would silently consume two
-	// S2 RPS slots and the per-build cap would undercount actual cost.
-	if got := inner.refCalls[0].limit; got > 100 {
-		t.Errorf("/references limit must stay ≤100 for 1:1 budget accounting, got %d", got)
 	}
 	if len(p.References) != 2 {
 		t.Fatalf("want 2 translated refs (DOI + arxiv-synthesised), got %d: %+v", len(p.References), p.References)
@@ -726,7 +721,7 @@ func TestResolvingTertiarySkipsPaginatedRefsWhenInlinePresent(t *testing.T) {
 				References: []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}}},
 			}, nil
 		}},
-		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
 			t.Fatalf("paginated /references must not fire when inline refs already populated")
 			return nil, nil
 		},
@@ -767,7 +762,7 @@ func TestResolvingTertiaryBatchCapsPaginatedRefsByBuildBudget(t *testing.T) {
 		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
 			return stubResp[currentLabel], nil
 		}},
-		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
 			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/" + id}}}, nil
 		},
 	}
@@ -806,7 +801,7 @@ func TestResolvingTertiaryBatchPaginatedRefsUnboundedWithoutBudget(t *testing.T)
 		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
 			return stubPapers, nil
 		}},
-		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
 			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/" + id}}}, nil
 		},
 	}

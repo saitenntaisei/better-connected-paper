@@ -79,12 +79,16 @@ type citerLister interface {
 	GetCitationsFrom(ctx context.Context, id string, offset, limit int, fields []string) ([]Paper, error)
 }
 
-// referenceLister lets the tertiary fall back to S2's paginated
-// /paper/{id}/references endpoint when the inline `references` field
-// returned empty — a common shape for recent arxiv preprints whose
-// metadata extraction has not finished propagating to the inline path.
-type referenceLister interface {
-	GetReferences(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
+// referencePager lets the tertiary fall back to S2's /paper/{id}/references
+// endpoint when the inline `references` field returned empty (a common
+// shape for recent arxiv preprints whose metadata extraction has not
+// finished propagating). The single-page method is intentional: the
+// per-build budget gating these calls counts one entry as exactly one
+// S2 RPS slot, and listPapers' auto-pagination would re-fetch when S2
+// returns null entries inside the data array, throwing the accounting
+// off by 2× silently.
+type referencePager interface {
+	GetReferencesSinglePage(ctx context.Context, id string, fields []string) ([]Paper, error)
 }
 
 // Search passes through; hybrid uses its result only to grab a hit.PaperID
@@ -366,20 +370,20 @@ func (r *ResolvingTertiary) Recommend(ctx context.Context, id string, limit int,
 // citedPaper entries — without this fallback, biblio coupling among
 // the recs cluster collapses to 0 and the cite arrows go missing.
 //
-// Limit is pinned to 100 so a single call equals exactly one S2 HTTP
-// request (perPage caps at 100 inside listPapers) — that keeps the
-// per-build budget accounting honest. The trade-off is that papers with
-// 100+ refs only contribute their first page, which is well past the
+// Goes through GetReferencesSinglePage (≤100 entries, exactly one S2
+// HTTP request) so the per-build budget that gated the call actually
+// matches one rate-limited slot. The trade-off is that papers with
+// >100 refs only contribute the first page; that's well past the
 // signal needed for biblio coupling and Salton normalisation anyway.
 func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id string, p *Paper, fields []string) {
 	if p == nil || len(p.References) > 0 || !requestsReferences(fields) {
 		return
 	}
-	lister, ok := r.Inner.(referenceLister)
+	pager, ok := r.Inner.(referencePager)
 	if !ok {
 		return
 	}
-	refs, err := lister.GetReferences(ctx, id, 100, []string{"paperId", "externalIds"})
+	refs, err := pager.GetReferencesSinglePage(ctx, id, []string{"paperId", "externalIds"})
 	if err != nil {
 		if r.Logger != nil {
 			r.Logger.Warn("tertiary: paginated refs supplement failed", "id", id, "err", err)

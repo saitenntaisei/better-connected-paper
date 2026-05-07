@@ -130,6 +130,46 @@ func (c *Client) GetCitations(ctx context.Context, id string, limit int, fields 
 	return papers, nil
 }
 
+// GetReferencesSinglePage fetches one /paper/{id}/references page (≤100
+// entries) in exactly one HTTP request — listPapers' auto-pagination
+// would silently re-fetch when S2 returns fewer-than-perPage parseable
+// entries (e.g. publisher-elided refs surface as nulls inside the data
+// array), and the per-build budget that gates the tertiary's paginated
+// refs fallback assumes one call equals one rate-limited slot.
+func (c *Client) GetReferencesSinglePage(ctx context.Context, id string, fields []string) ([]Paper, error) {
+	nestedFields := make([]string, len(fields))
+	for i, f := range fields {
+		nestedFields[i] = "citedPaper." + f
+	}
+	q := url.Values{}
+	q.Set("limit", "100")
+	q.Set("offset", "0")
+	q.Set("fields", strings.Join(nestedFields, ","))
+
+	var raw struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := c.get(ctx, "/paper/"+url.PathEscape(id)+"/references?"+q.Encode(), &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Paper, 0, len(raw.Data))
+	for _, entry := range raw.Data {
+		body, ok := entry["citedPaper"]
+		if !ok {
+			continue
+		}
+		var p Paper
+		if err := json.Unmarshal(body, &p); err != nil {
+			return nil, fmt.Errorf("decode citedPaper: %w", err)
+		}
+		if p.PaperID == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 // GetCitationsFrom returns citers starting at offset, up to limit items. It
 // exists to paginate past S2's inline citations cap (1000) without re-fetching
 // the same first 1000. Used by ResolvingTertiary to catch recent preprints
