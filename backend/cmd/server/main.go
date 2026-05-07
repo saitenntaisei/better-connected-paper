@@ -195,6 +195,11 @@ func newHybridTertiary(logger *slog.Logger, primary *citation.OpenAlexClient, se
 			return nil
 		}
 		logger.Info("citation provider", "provider", "hybrid", "tertiary", "semanticscholar")
+		var ar5iv citation.ArxivRefsFetcher
+		if !strings.EqualFold(os.Getenv("CITATION_AR5IV"), "off") {
+			ar5iv = citation.NewAr5ivClient(citation.Ar5ivOptions{})
+			logger.Info("citation provider", "ar5iv-fallback", "enabled")
+		}
 		return &citation.ResolvingTertiary{
 			Inner:    citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")}),
 			Resolver: primary.ResolveByDOI,
@@ -204,6 +209,7 @@ func newHybridTertiary(logger *slog.Logger, primary *citation.OpenAlexClient, se
 			// RDT) lives in offset 900-1100 of the paginated order. 500 covers
 			// that band on the anon S2 tier (~15 s, one-shot per seed).
 			CiterSupplementLimit: 500,
+			Ar5iv:                ar5iv,
 		}
 	default:
 		return nil

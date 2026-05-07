@@ -140,10 +140,16 @@ func vercelHybridTertiary(primary *citation.OpenAlexClient, secondary citation.P
 			return nil
 		}
 		log.Printf("init: citation provider = hybrid (+ semanticscholar tertiary)")
+		var ar5iv citation.ArxivRefsFetcher
+		if !strings.EqualFold(os.Getenv("CITATION_AR5IV"), "off") {
+			ar5iv = citation.NewAr5ivClient(citation.Ar5ivOptions{})
+			log.Printf("init: citation provider = hybrid (+ ar5iv refs fallback)")
+		}
 		return &citation.ResolvingTertiary{
 			Inner:                citation.New(citation.Options{APIKey: os.Getenv("SEMANTIC_SCHOLAR_API_KEY")}),
 			Resolver:             primary.ResolveByDOI,
 			CiterSupplementLimit: 500,
+			Ar5iv:                ar5iv,
 		}
 	default:
 		return nil

@@ -820,6 +820,124 @@ func TestResolvingTertiaryBatchPaginatedRefsUnboundedWithoutBudget(t *testing.T)
 	}
 }
 
+// stubAr5iv satisfies ArxivRefsFetcher for testing the ar5iv cascade
+// inside ResolvingTertiary.supplementRefsViaPagination.
+type stubAr5iv struct {
+	fn    func(ctx context.Context, arxivID string) ([]Paper, error)
+	calls []string
+}
+
+func (s *stubAr5iv) GetReferences(ctx context.Context, arxivID string) ([]Paper, error) {
+	s.calls = append(s.calls, arxivID)
+	if s.fn == nil {
+		return nil, nil
+	}
+	return s.fn(ctx, arxivID)
+}
+
+// AAAI / ICML papers commonly come back from S2 with publisher-elided
+// references — paginated /references returns no useful entries. The
+// tertiary must then reach for ar5iv to recover the bibliography from
+// the LaTeX-rendered HTML and translate it through the existing
+// resolver chain.
+func TestResolvingTertiaryAr5ivFallbackWhenPaginatedEmpty(t *testing.T) {
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:     "S2HEX",
+				ExternalIDs: ExternalIDs{"ArXiv": "2511.99999"},
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return nil, nil // S2 paginated returned empty (publisher elision)
+		},
+	}
+	ar5iv := &stubAr5iv{
+		fn: func(ctx context.Context, arxivID string) ([]Paper, error) {
+			return []Paper{
+				{ExternalIDs: ExternalIDs{"ArXiv": "2502.13923"}},
+				{ExternalIDs: ExternalIDs{"ArXiv": "2503.17434"}},
+			}, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver, Ar5iv: ar5iv}
+
+	p, err := r.GetPaper(context.Background(), "ARXIV:2511.99999", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ar5iv.calls) != 1 || ar5iv.calls[0] != "2511.99999" {
+		t.Fatalf("ar5iv must be called once with the seed arxiv id, got %v", ar5iv.calls)
+	}
+	if len(p.References) != 2 {
+		t.Errorf("want 2 translated refs from ar5iv, got %d: %+v", len(p.References), p.References)
+	}
+}
+
+// When S2 paginated already returned refs, the ar5iv fallback shouldn't
+// fire — paying for an extra HTTP request and budget unit is wasteful
+// when the cheaper path already succeeded.
+func TestResolvingTertiaryAr5ivSkippedWhenPaginatedHasRefs(t *testing.T) {
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{PaperID: "S2HEX", ExternalIDs: ExternalIDs{"ArXiv": "2511.99999"}}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}}}, nil
+		},
+	}
+	ar5iv := &stubAr5iv{
+		fn: func(ctx context.Context, arxivID string) ([]Paper, error) {
+			t.Fatalf("ar5iv must not fire when paginated /references supplied refs")
+			return nil, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		return []Paper{{PaperID: "W_a"}}, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver, Ar5iv: ar5iv}
+
+	if _, err := r.GetPaper(context.Background(), "ARXIV:2511.99999", []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ar5iv.calls) != 0 {
+		t.Fatalf("ar5iv called %d times, want 0", len(ar5iv.calls))
+	}
+}
+
+// Without an arxiv id (no ArXiv ext, no arxiv DOI) ar5iv has nothing
+// to look up — the cascade must skip it cleanly.
+func TestResolvingTertiaryAr5ivSkippedWhenNoArxivID(t *testing.T) {
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{PaperID: "S2HEX", ExternalIDs: ExternalIDs{"DOI": "10.1/journal"}}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return nil, nil
+		},
+	}
+	ar5iv := &stubAr5iv{
+		fn: func(ctx context.Context, arxivID string) ([]Paper, error) {
+			t.Fatalf("ar5iv must not fire when no arxiv id is derivable")
+			return nil, nil
+		},
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: func(ctx context.Context, dois []string) ([]Paper, error) { return nil, nil }, Ar5iv: ar5iv}
+	if _, err := r.GetPaper(context.Background(), "DOI:10.1/journal", []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ar5iv.calls) != 0 {
+		t.Fatalf("ar5iv called %d times, want 0", len(ar5iv.calls))
+	}
+}
+
 // stubCiterProvider is a stubProvider that also satisfies citerLister.
 type stubCiterProvider struct {
 	stubProvider

@@ -141,6 +141,15 @@ type Embedder interface {
 	EmbeddingsByExternalID(ctx context.Context, ids []string) (map[string][]float32, error)
 }
 
+// ArxivRefsFetcher returns the bibliography of an arxiv preprint as a
+// list of Papers (with at least ArXiv populated in ExternalIDs). It's
+// the last-resort refs fallback for papers whose references S2 has
+// elided under publisher embargo — *Ar5ivClient implements it by
+// scraping ar5iv.labs.arxiv.org's HTML rendering.
+type ArxivRefsFetcher interface {
+	GetReferences(ctx context.Context, arxivID string) ([]Paper, error)
+}
+
 // DefaultPaperFields covers everything the frontend + graph builder needs.
 var DefaultPaperFields = []string{
 	"paperId", "title", "abstract", "year", "venue",
