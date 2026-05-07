@@ -71,6 +71,11 @@ type ResolvingTertiary struct {
 	// surfaces a disjoint band — where recent preprints (e.g. the 2024
 	// robotics cluster that cites Octo) tend to cluster. 0 disables.
 	CiterSupplementLimit int
+	// Ar5iv is consulted as a deepest-tier refs fallback when both the
+	// inline and the S2 paginated /references paths return nothing —
+	// typically because the publisher has elided the references field on
+	// S2 (AAAI / ICML etc.). Optional: nil disables the fallback.
+	Ar5iv ArxivRefsFetcher
 }
 
 // citerLister lets the tertiary supplement the inline 1000-item cap without
@@ -375,12 +380,22 @@ func (r *ResolvingTertiary) Recommend(ctx context.Context, id string, limit int,
 // matches one rate-limited slot. The trade-off is that papers with
 // >100 refs only contribute the first page; that's well past the
 // signal needed for biblio coupling and Salton normalisation anyway.
+//
+// When the paginated path returns empty AND the paper carries an arxiv
+// id, falls back to ar5iv (LaTeX→HTML rendering of the source) to
+// recover the bibliography. Counts in the same per-paper budget the
+// caller already consumed — ar5iv is on a separate rate limiter from
+// S2 so the wall-clock cost is additive but not contended.
 func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id string, p *Paper, fields []string) {
 	if p == nil || len(p.References) > 0 || !requestsReferences(fields) {
 		return
 	}
-	pager, ok := r.Inner.(referencePager)
-	if !ok {
+	pager, hasPager := r.Inner.(referencePager)
+	if !hasPager && r.Ar5iv == nil {
+		return
+	}
+	if !hasPager {
+		r.fillRefsFromAr5iv(ctx, id, p)
 		return
 	}
 	refs, err := pager.GetReferencesSinglePage(ctx, id, []string{"paperId", "externalIds"})
@@ -388,13 +403,18 @@ func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id 
 		if r.Logger != nil {
 			r.Logger.Warn("tertiary: paginated refs supplement failed", "id", id, "err", err)
 		}
+		// Don't bail — ar5iv lives on a separate rate limiter and serves
+		// HTML directly from arxiv-labs, so a transient S2 429 (the most
+		// common error here) shouldn't lock out the cite-arrows path.
+		r.fillRefsFromAr5iv(ctx, id, p)
 		return
 	}
 	if len(refs) == 0 {
-		// No log: S2 routinely returns 0 for new arxiv preprints whose
-		// venues (AAAI etc.) have elided the references field via
-		// publisher embargo. Logging every miss would dominate log volume
-		// for sparse-seed builds.
+		// S2 returned no usable refs (often publisher elision on AAAI /
+		// ICML etc.). Try ar5iv as the last-resort fallback — its HTML
+		// rendering of the LaTeX source carries the full bibliography
+		// regardless of S2 embargoes.
+		r.fillRefsFromAr5iv(ctx, id, p)
 		return
 	}
 	p.References = refs
@@ -404,6 +424,64 @@ func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id 
 	if r.Logger != nil {
 		r.Logger.Info("tertiary: paginated refs supplement", "id", id, "added", len(refs))
 	}
+}
+
+// fillRefsFromAr5iv pulls a paper's bibliography out of the arxiv-labs
+// HTML rendering and stores it on p.References. The returned papers
+// carry only ArXiv externalIds, which the existing translator maps to
+// W-IDs via the synthesised 10.48550/arxiv.<id> form during
+// translate / translateRefsBatch.
+func (r *ResolvingTertiary) fillRefsFromAr5iv(ctx context.Context, id string, p *Paper) {
+	if r.Ar5iv == nil || p == nil {
+		return
+	}
+	arxivID := arxivIDFromPaper(p, id)
+	if arxivID == "" {
+		return
+	}
+	refs, err := r.Ar5iv.GetReferences(ctx, arxivID)
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("tertiary: ar5iv refs supplement failed", "arxivID", arxivID, "err", err)
+		}
+		return
+	}
+	if len(refs) == 0 {
+		return
+	}
+	p.References = refs
+	if p.ReferenceCount < len(refs) {
+		p.ReferenceCount = len(refs)
+	}
+	if r.Logger != nil {
+		r.Logger.Info("tertiary: ar5iv refs supplement", "arxivID", arxivID, "added", len(refs))
+	}
+}
+
+// arxivIDFromPaper picks the most reliable source of an arxiv id —
+// preferring the paper's own ExternalIDs over a "ARXIV:..." or
+// "DOI:10.48550/arxiv...." prefix on the input id, since the input may
+// have been the S2 hex paperId returned from a batch fetch. Returns ""
+// when no arxiv id is derivable.
+func arxivIDFromPaper(p *Paper, id string) string {
+	if p != nil {
+		if a := strings.TrimSpace(p.ExternalIDs["ArXiv"]); a != "" {
+			return a
+		}
+		doi := strings.ToLower(strings.TrimSpace(p.ExternalIDs["DOI"]))
+		if strings.HasPrefix(doi, "10.48550/arxiv.") {
+			return strings.TrimPrefix(doi, "10.48550/arxiv.")
+		}
+	}
+	if id != "" {
+		switch {
+		case strings.HasPrefix(strings.ToUpper(id), "ARXIV:"):
+			return strings.TrimSpace(id[len("ARXIV:"):])
+		case strings.HasPrefix(strings.ToLower(id), "doi:10.48550/arxiv."):
+			return strings.TrimPrefix(strings.ToLower(id), "doi:10.48550/arxiv.")
+		}
+	}
+	return ""
 }
 
 // EmbeddingsByExternalID delegates to the inner provider when it implements
