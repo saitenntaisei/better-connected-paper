@@ -131,11 +131,13 @@ func (c *Client) GetCitations(ctx context.Context, id string, limit int, fields 
 }
 
 // GetReferencesSinglePage fetches one /paper/{id}/references page (≤100
-// entries) in exactly one HTTP request — listPapers' auto-pagination
-// would silently re-fetch when S2 returns fewer-than-perPage parseable
-// entries (e.g. publisher-elided refs surface as nulls inside the data
-// array), and the per-build budget that gates the tertiary's paginated
-// refs fallback assumes one call equals one rate-limited slot.
+// entries) in exactly one HTTP attempt — listPapers' auto-pagination
+// would silently re-fetch when S2 returns null/elided entries inside
+// the data array, and do()'s retry loop would burn 1 + maxRetries
+// rate-limited slots (each waiting up to 30 s on Retry-After) per
+// transient 429. The per-build budget that gates this fallback assumes
+// one logical call equals one S2 RPS slot, so we go through getOnce
+// (single attempt, surfaces 429 as ErrRateLimited) rather than get.
 func (c *Client) GetReferencesSinglePage(ctx context.Context, id string, fields []string) ([]Paper, error) {
 	nestedFields := make([]string, len(fields))
 	for i, f := range fields {
@@ -149,7 +151,7 @@ func (c *Client) GetReferencesSinglePage(ctx context.Context, id string, fields 
 	var raw struct {
 		Data []map[string]json.RawMessage `json:"data"`
 	}
-	if err := c.get(ctx, "/paper/"+url.PathEscape(id)+"/references?"+q.Encode(), &raw); err != nil {
+	if err := c.getOnce(ctx, "/paper/"+url.PathEscape(id)+"/references?"+q.Encode(), &raw); err != nil {
 		return nil, err
 	}
 	out := make([]Paper, 0, len(raw.Data))
@@ -344,7 +346,20 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	return c.do(ctx, http.MethodGet, path, nil, out)
 }
 
+// getOnce mirrors get but performs exactly one HTTP attempt — no retry
+// on 429/5xx. Used by the budget-capped refs fallback so the caller's
+// "1 call == 1 rate-limited slot" accounting holds even when S2 throws
+// transient errors that would otherwise burn 3 × maxRetries × Retry-After
+// seconds on this single supplement step.
+func (c *Client) getOnce(ctx context.Context, path string, out any) error {
+	return c.doAttempts(ctx, http.MethodGet, path, nil, out, 0)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {
+	return c.doAttempts(ctx, method, path, body, out, c.maxRetries)
+}
+
+func (c *Client) doAttempts(ctx context.Context, method, path string, body io.Reader, out any, maxRetries int) error {
 	var reqBody []byte
 	if body != nil {
 		b, err := io.ReadAll(body)
@@ -362,7 +377,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if err := c.limiter.Wait(ctx); err != nil {
 			return err
 		}
@@ -387,6 +402,9 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
+			if attempt >= maxRetries {
+				break
+			}
 			if !sleepCtx(ctx, backoff(attempt)) {
 				return ctx.Err()
 			}
@@ -404,6 +422,9 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("semanticscholar: HTTP %d", resp.StatusCode)
+			if attempt >= maxRetries {
+				break
+			}
 			// S2 often returns Retry-After on 429 — honor it when present,
 			// otherwise use exponential backoff. Clamp to 30s to avoid
 			// stalling the whole request beyond the Vercel function budget.

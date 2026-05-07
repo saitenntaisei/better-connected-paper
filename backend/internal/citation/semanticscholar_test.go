@@ -89,6 +89,38 @@ func TestEmbeddingsByExternalID(t *testing.T) {
 	}
 }
 
+// GetReferencesSinglePage must hit S2 exactly once even on a 429: the
+// per-build refs-budget assumes one logical call equals one rate-limited
+// slot, and the previous do() retry loop would silently burn 1 +
+// maxRetries slots (each waiting up to 30 s on Retry-After) on this
+// supplement step.
+func TestGetReferencesSinglePageDoesNotRetryOn429(t *testing.T) {
+	var calls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/paper/X/references", func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	c := newTestClient(t, mux)
+
+	start := time.Now()
+	_, err := c.GetReferencesSinglePage(context.Background(), "X", []string{"paperId"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want error on 429, got nil")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("HTTP attempts: got %d, want 1 (no-retry contract)", got)
+	}
+	// 30 s Retry-After must NOT be honoured when the budget allowed only
+	// one attempt — keeping wall-clock under a few seconds is the whole
+	// point of the no-retry path.
+	if elapsed > 5*time.Second {
+		t.Errorf("getOnce should not sleep on terminal 429, elapsed %v", elapsed)
+	}
+}
+
 func TestRecommend(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/recommendations/v1/papers/forpaper/SEED", func(w http.ResponseWriter, r *http.Request) {
