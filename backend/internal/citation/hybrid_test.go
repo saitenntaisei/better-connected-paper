@@ -3,6 +3,7 @@ package citation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,8 +14,10 @@ type stubProvider struct {
 	search     func(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error)
 	getPaper   func(ctx context.Context, id string, fields []string) (*Paper, error)
 	getBatch   func(ctx context.Context, ids []string, fields []string) ([]Paper, error)
+	recommend  func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
 	calls      []stubCall
 	batchCalls []stubBatchCall
+	recCalls   []stubCall
 }
 
 type stubCall struct {
@@ -42,6 +45,15 @@ func (s *stubProvider) GetPaper(ctx context.Context, id string, fields []string)
 func (s *stubProvider) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
 	s.batchCalls = append(s.batchCalls, stubBatchCall{ids: ids, fields: fields})
 	return s.getBatch(ctx, ids, fields)
+}
+
+// Recommend lets stubProvider double as a Recommender for tests that wire
+// it as ResolvingTertiary.Inner. Methods without a wired func surface a
+// nil-deref so the test fails loudly if the code under test calls Recommend
+// when it shouldn't.
+func (s *stubProvider) Recommend(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+	s.recCalls = append(s.recCalls, stubCall{id: id, fields: fields})
+	return s.recommend(ctx, id, limit, fields)
 }
 
 func TestHybridSearchAlwaysPrimary(t *testing.T) {
@@ -637,6 +649,177 @@ func TestResolvingTertiaryDoesNotEnrichWhenCallerDidNotAsk(t *testing.T) {
 	}
 }
 
+// stubRefLister is a stubProvider that also satisfies referencePager so
+// tests can wire ResolvingTertiary's single-page /references fallback.
+type stubRefLister struct {
+	stubProvider
+	refs     func(ctx context.Context, id string, fields []string) ([]Paper, error)
+	refCalls []refCall
+}
+
+type refCall struct {
+	id string
+}
+
+func (s *stubRefLister) GetReferencesSinglePage(ctx context.Context, id string, fields []string) ([]Paper, error) {
+	s.refCalls = append(s.refCalls, refCall{id: id})
+	if s.refs == nil {
+		return nil, nil
+	}
+	return s.refs(ctx, id, fields)
+}
+
+func TestResolvingTertiaryFallsBackToPaginatedRefsWhenInlineEmpty(t *testing.T) {
+	// AsyncVLA-style: S2's /paper response has zero inline refs (the field
+	// isn't populated for many recent arxiv preprints), but the paginated
+	// /paper/{id}/references endpoint does return refs. The tertiary must
+	// notice the empty inline result and fall back to the paginated call,
+	// then translate the cited papers into primary-space W-IDs.
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:    "S2HEX",
+				References: nil, // inline empty
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return []Paper{
+				{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}},
+				{ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
+			}, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver}
+
+	p, err := r.GetPaper(context.Background(), "ARXIV:2511.14148", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly one HTTP request: the single-page interface guarantees
+	// listPapers' auto-pagination can't double-spend the per-build budget.
+	if len(inner.refCalls) != 1 {
+		t.Fatalf("paginated /references must be called once when inline empty, got %d", len(inner.refCalls))
+	}
+	if len(p.References) != 2 {
+		t.Fatalf("want 2 translated refs (DOI + arxiv-synthesised), got %d: %+v", len(p.References), p.References)
+	}
+}
+
+func TestResolvingTertiarySkipsPaginatedRefsWhenInlinePresent(t *testing.T) {
+	// Inline already populated → no need to pay for an extra paginated call.
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:    "S2HEX",
+				References: []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}}},
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			t.Fatalf("paginated /references must not fire when inline refs already populated")
+			return nil, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		return []Paper{{PaperID: "W_x"}}, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver}
+	if _, err := r.GetPaper(context.Background(), "ARXIV:Y", []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.refCalls) != 0 {
+		t.Fatalf("expected 0 paginated calls, got %d", len(inner.refCalls))
+	}
+}
+
+// A per-build budget shared across multiple GetPaperBatch calls is what
+// keeps a chunked first-hop (BatchSize 100, MaxFirstHop 300) from firing
+// 6 × per-batch budgets in series and blowing the Vercel function cap.
+// Two consecutive batches drawing from the same WithRefsBackfillBudget
+// ctx must split the budget, not get a fresh allowance each.
+func TestResolvingTertiaryBatchCapsPaginatedRefsByBuildBudget(t *testing.T) {
+	const budget = 4
+	makeBatch := func(prefix string, n int) ([]string, []Paper) {
+		ids := make([]string, n)
+		ps := make([]Paper, n)
+		for i := 0; i < n; i++ {
+			ids[i] = fmt.Sprintf("%s%d", prefix, i)
+			ps[i] = Paper{PaperID: ids[i]}
+		}
+		return ids, ps
+	}
+	idsA, papersA := makeBatch("a", 3)
+	idsB, papersB := makeBatch("b", 5) // total 8 empty-refs across two batches
+	stubResp := map[string][]Paper{"A": papersA, "B": papersB}
+	currentLabel := ""
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+			return stubResp[currentLabel], nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/" + id}}}, nil
+		},
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}}
+	ctx := WithRefsBackfillBudget(context.Background(), budget)
+	currentLabel = "A"
+	if _, err := r.GetPaperBatch(ctx, idsA, []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	currentLabel = "B"
+	if _, err := r.GetPaperBatch(ctx, idsB, []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(inner.refCalls); got != budget {
+		t.Errorf("paginated /references calls across two batches: got %d, want %d (budget shared)", got, budget)
+	}
+}
+
+// Without a budget attached the fallback is unbounded — preserve the
+// pre-cap behaviour for non-Builder callers (CLI scripts, tests).
+func TestResolvingTertiaryBatchPaginatedRefsUnboundedWithoutBudget(t *testing.T) {
+	const inputs = 25
+	ids := make([]string, inputs)
+	stubPapers := make([]Paper, inputs)
+	for i := 0; i < inputs; i++ {
+		ids[i] = fmt.Sprintf("hex%d", i)
+		stubPapers[i] = Paper{PaperID: ids[i]}
+	}
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+			return stubPapers, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/" + id}}}, nil
+		},
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}}
+	if _, err := r.GetPaperBatch(context.Background(), ids, []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(inner.refCalls); got != inputs {
+		t.Errorf("without budget all empty-refs should fall through, got %d / %d", got, inputs)
+	}
+}
+
 // stubCiterProvider is a stubProvider that also satisfies citerLister.
 type stubCiterProvider struct {
 	stubProvider
@@ -751,6 +934,90 @@ func TestResolvingTertiaryDoesNotSupplementWhenLimitZero(t *testing.T) {
 	if len(inner.citerCalls) != 0 {
 		t.Fatalf("expected no paginated calls, got %d", len(inner.citerCalls))
 	}
+}
+
+func TestResolvingTertiaryRecommendTranslatesArxivAndDOIs(t *testing.T) {
+	// S2 recommendations come back in S2 paperId space with ArXiv (and
+	// sometimes DOI) externalIds. The tertiary must translate both into
+	// primary-space W-IDs by synthesising 10.48550/arxiv.<id> when the rec
+	// only has an ArXiv id, and dropping recs that have neither.
+	inner := &stubProvider{
+		recommend: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+			return []Paper{
+				{PaperID: "rec_doi", ExternalIDs: ExternalIDs{"DOI": "10.1/explicit"}},
+				{PaperID: "rec_arxiv_only", ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
+				{PaperID: "rec_arxiv_upper", ExternalIDs: ExternalIDs{"ArXiv": "2511.99002", "DOI": ""}}, // empty DOI shouldn't suppress arxiv synthesis
+				{PaperID: "rec_neither"}, // dropped
+			}, nil
+		},
+	}
+	var resolved [][]string
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		resolved = append(resolved, append([]string(nil), dois...))
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver}
+	got, err := r.Recommend(context.Background(), "SEED_HEX", 10, []string{"paperId", "title"})
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 translated recs, got %d: %+v", len(got), got)
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("want exactly 1 resolver call (batched), got %d: %v", len(resolved), resolved)
+	}
+	doiSet := map[string]bool{}
+	for _, d := range resolved[0] {
+		doiSet[d] = true
+	}
+	if !doiSet["10.1/explicit"] || !doiSet["10.48550/arxiv.2511.99001"] || !doiSet["10.48550/arxiv.2511.99002"] {
+		t.Errorf("missing expected DOIs in resolver call: %v", resolved[0])
+	}
+}
+
+func TestResolvingTertiaryRecommendNilOnNonRecommenderInner(t *testing.T) {
+	// The Inner must implement Recommender for tertiary to forward calls. A
+	// plain PaperProvider stub (no recommend func) should yield nil/empty so
+	// the builder's fallback can short-circuit gracefully.
+	inner := &stubProvider{} // no recommend func wired
+	type onlyPaperProvider interface {
+		Search(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error)
+		GetPaper(ctx context.Context, id string, fields []string) (*Paper, error)
+		GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error)
+	}
+	// Compile-time check that stubProvider satisfies the narrow interface;
+	// the assertion at runtime in tertiary should not depend on this.
+	var _ onlyPaperProvider = inner
+
+	r := &ResolvingTertiary{Inner: paperProviderOnly{inner}}
+	got, err := r.Recommend(context.Background(), "SEED", 10, nil)
+	if err != nil {
+		t.Fatalf("recommend on non-Recommender inner: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("want empty, got %d recs", len(got))
+	}
+}
+
+// paperProviderOnly hides the embedded stubProvider's Recommend method so
+// the type assertion to Recommender inside ResolvingTertiary.Recommend
+// fails — modeling a real PaperProvider that lacks recommendations support.
+type paperProviderOnly struct{ p PaperProvider }
+
+func (p paperProviderOnly) Search(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error) {
+	return p.p.Search(ctx, q, limit, fields)
+}
+func (p paperProviderOnly) GetPaper(ctx context.Context, id string, fields []string) (*Paper, error) {
+	return p.p.GetPaper(ctx, id, fields)
+}
+func (p paperProviderOnly) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+	return p.p.GetPaperBatch(ctx, ids, fields)
 }
 
 func TestResolvingTertiaryBatchTranslatesRefs(t *testing.T) {

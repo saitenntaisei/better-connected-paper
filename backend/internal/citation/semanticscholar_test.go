@@ -50,6 +50,107 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsByExternalID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/paper/batch", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("fields"); got != "paperId,externalIds,embedding.specter_v2" {
+			t.Errorf("fields query: got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"paperId": "p1", "externalIds": map[string]string{"DOI": "10.1/A"}, "embedding": map[string]any{"vector": []float32{0.1, 0.2, 0.3}}},
+			{"paperId": "p2", "externalIds": map[string]string{"DOI": "10.1/b"}, "embedding": map[string]any{"vector": []float32{0.4, 0.5, 0.6}}},
+			nil, // 3rd id was missing in S2 — must be skipped, not error
+			{"paperId": "p3", "externalIds": map[string]string{"DOI": "10.1/c"}}, // no embedding — skipped
+		})
+	})
+	c := newTestClient(t, mux)
+
+	got, err := c.EmbeddingsByExternalID(context.Background(), []string{"DOI:10.1/A", "DOI:10.1/b", "DOI:10.1/missing", "DOI:10.1/c"})
+	if err != nil {
+		t.Fatalf("embeddings: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 embeddings (only p1+p2 have vectors), got %d: %v", len(got), got)
+	}
+	// Keys mirror the caller's input ids (positional match against the
+	// batch response) so callers can register multiple lookups per paper —
+	// "DOI:..." and "ARXIV:..." — and consult either form.
+	if v, ok := got["DOI:10.1/A"]; !ok || len(v) != 3 {
+		t.Errorf("p1 missing or wrong dim: %+v", got)
+	}
+	if _, ok := got["DOI:10.1/b"]; !ok {
+		t.Errorf("p2 missing")
+	}
+	if _, ok := got["DOI:10.1/missing"]; ok {
+		t.Errorf("null entry must not produce an embedding")
+	}
+	if _, ok := got["DOI:10.1/c"]; ok {
+		t.Errorf("entry without embedding must not appear")
+	}
+}
+
+// GetReferencesSinglePage must hit S2 exactly once even on a 429: the
+// per-build refs-budget assumes one logical call equals one rate-limited
+// slot, and the previous do() retry loop would silently burn 1 +
+// maxRetries slots (each waiting up to 30 s on Retry-After) on this
+// supplement step.
+func TestGetReferencesSinglePageDoesNotRetryOn429(t *testing.T) {
+	var calls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/paper/X/references", func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	c := newTestClient(t, mux)
+
+	start := time.Now()
+	_, err := c.GetReferencesSinglePage(context.Background(), "X", []string{"paperId"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want error on 429, got nil")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("HTTP attempts: got %d, want 1 (no-retry contract)", got)
+	}
+	// 30 s Retry-After must NOT be honoured when the budget allowed only
+	// one attempt — keeping wall-clock under a few seconds is the whole
+	// point of the no-retry path.
+	if elapsed > 5*time.Second {
+		t.Errorf("getOnce should not sleep on terminal 429, elapsed %v", elapsed)
+	}
+}
+
+func TestRecommend(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/recommendations/v1/papers/forpaper/SEED", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("limit") != "20" {
+			t.Errorf("limit got %q want 20", r.URL.Query().Get("limit"))
+		}
+		if r.URL.Query().Get("fields") != "paperId,externalIds,title" {
+			t.Errorf("fields got %q", r.URL.Query().Get("fields"))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"recommendedPapers": []Paper{
+				{PaperID: "rec1", Title: "ProbeFlow", ExternalIDs: ExternalIDs{"ArXiv": "2511.99001"}},
+				{PaperID: "rec2", Title: "AR-VLA", ExternalIDs: ExternalIDs{"ArXiv": "2511.99002", "DOI": "10.48550/arxiv.2511.99002"}},
+			},
+		})
+	})
+	c := newTestClient(t, mux)
+
+	got, err := c.Recommend(context.Background(), "SEED", 20, []string{"paperId", "externalIds", "title"})
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(got) != 2 || got[0].PaperID != "rec1" || got[1].PaperID != "rec2" {
+		t.Fatalf("unexpected: %+v", got)
+	}
+	if got[0].ExternalIDs["ArXiv"] != "2511.99001" {
+		t.Errorf("want ArXiv preserved, got %v", got[0].ExternalIDs)
+	}
+}
+
 func TestGetPaperNotFound(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/paper/missing", func(w http.ResponseWriter, _ *http.Request) {

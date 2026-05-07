@@ -401,6 +401,109 @@ func TestBuildBridgeOutranksWeakFirstHop(t *testing.T) {
 	}
 }
 
+// recStub records the lookup ids the builder asks for so we can assert it
+// (a) calls Recommend on sparse seeds and (b) skips it on dense seeds.
+type recStub struct {
+	fn    func(ctx context.Context, id string, limit int, fields []string) ([]citation.Paper, error)
+	calls []recCall
+}
+type recCall struct{ id string }
+
+func (r *recStub) Recommend(ctx context.Context, id string, limit int, fields []string) ([]citation.Paper, error) {
+	r.calls = append(r.calls, recCall{id: id})
+	if r.fn == nil {
+		return nil, nil
+	}
+	return r.fn(ctx, id, limit, fields)
+}
+
+// AsyncVLA-shaped: sparse seed (0 refs / 0 cites) with an arxiv DOI. The
+// Recommender supplies one neighbour that references the seed; without
+// recs the build would yield a single-node graph (the symptom Connected
+// Papers avoids by leaning on the same recommendations endpoint).
+func TestBuildAugmentsSparseSeedViaRecommender(t *testing.T) {
+	s2 := &stubS2{papers: map[string]citation.Paper{
+		"S": {
+			PaperID:     "S",
+			Title:       "Sparse Seed",
+			Year:        2025,
+			ExternalIDs: citation.ExternalIDs{"DOI": "10.48550/arxiv.0000.0001"},
+		},
+		"REC1": paper("REC1", []string{"S"}, nil),
+	}}
+	rec := &recStub{
+		fn: func(ctx context.Context, id string, limit int, fields []string) ([]citation.Paper, error) {
+			return []citation.Paper{{PaperID: "REC1"}}, nil
+		},
+	}
+	b := &Builder{S2: s2, Recommender: rec, MaxNodes: 10, SimilarityEdgeThreshold: 0.0001}
+
+	resp, err := b.Build(context.Background(), "S")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("recommender should be invoked once for sparse seed, got %d calls", len(rec.calls))
+	}
+	if want := "DOI:10.48550/arxiv.0000.0001"; rec.calls[0].id != want {
+		t.Errorf("recommender lookup id: got %q, want %q", rec.calls[0].id, want)
+	}
+	have := map[string]bool{}
+	for _, n := range resp.Nodes {
+		have[n.ID] = true
+	}
+	if !have["REC1"] {
+		t.Errorf("rec was not surfaced in graph; nodes=%v", have)
+	}
+}
+
+// Dense seeds (≥ threshold refs+cites) have plenty of citation signal on
+// their own — paying the extra recs round-trip there is just noise/cost.
+func TestBuildSkipsRecommenderOnDenseSeed(t *testing.T) {
+	seedRefs := []string{}
+	papers := map[string]citation.Paper{}
+	for i := 0; i < 12; i++ {
+		id := "R" + string(rune('a'+i))
+		seedRefs = append(seedRefs, id)
+		papers[id] = paper(id, nil, nil)
+	}
+	papers["S"] = paper("S", seedRefs, nil)
+	rec := &recStub{
+		fn: func(ctx context.Context, id string, limit int, fields []string) ([]citation.Paper, error) {
+			t.Fatalf("recommender must NOT fire for dense seed")
+			return nil, nil
+		},
+	}
+	b := &Builder{S2: &stubS2{papers: papers}, Recommender: rec, MaxNodes: 10}
+	if _, err := b.Build(context.Background(), "S"); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("recommender called %d times on dense seed, want 0", len(rec.calls))
+	}
+}
+
+// A seed with neither DOI nor ArXiv id has no way to talk to the recs
+// endpoint, so the builder must skip the call without erroring.
+func TestBuildSkipsRecommenderWhenSeedHasNoLookupID(t *testing.T) {
+	s2 := &stubS2{papers: map[string]citation.Paper{
+		"S": {PaperID: "S", Title: "noid"},
+	}}
+	rec := &recStub{
+		fn: func(ctx context.Context, id string, limit int, fields []string) ([]citation.Paper, error) {
+			t.Fatalf("recommender must NOT fire when seed lacks DOI/ArXiv")
+			return nil, nil
+		},
+	}
+	b := &Builder{S2: s2, Recommender: rec, MaxNodes: 10}
+	if _, err := b.Build(context.Background(), "S"); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("recommender called %d times on no-id seed, want 0", len(rec.calls))
+	}
+}
+
 func TestBuildRespectsMaxNodes(t *testing.T) {
 	refs := []string{}
 	papers := map[string]citation.Paper{}

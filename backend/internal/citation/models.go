@@ -1,6 +1,7 @@
 package citation
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -123,6 +124,21 @@ type ListResponse[T any] struct {
 	Offset int `json:"offset"`
 	Next   int `json:"next,omitempty"`
 	Data   []T `json:"data"`
+}
+
+// Recommender returns papers similar to a given paper. The S2 client
+// implements it via /recommendations/v1/papers/forpaper/{id}; type
+// assertions let optional callers (graph builder, ResolvingTertiary)
+// detect whether their underlying provider supports it.
+type Recommender interface {
+	Recommend(ctx context.Context, id string, limit int, fields []string) ([]Paper, error)
+}
+
+// Embedder fetches specter_v2 paper embeddings keyed by lowercase DOI.
+// Used by the graph builder to layer semantic-similarity edges over
+// candidates whose refs+cites are too sparse for biblio coupling.
+type Embedder interface {
+	EmbeddingsByExternalID(ctx context.Context, ids []string) (map[string][]float32, error)
 }
 
 // DefaultPaperFields covers everything the frontend + graph builder needs.
