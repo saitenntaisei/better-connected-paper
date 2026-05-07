@@ -365,6 +365,12 @@ func (r *ResolvingTertiary) Recommend(ctx context.Context, id string, limit int,
 // canonical case) while the paginated endpoint still returns 30-100
 // citedPaper entries — without this fallback, biblio coupling among
 // the recs cluster collapses to 0 and the cite arrows go missing.
+//
+// Limit is pinned to 100 so a single call equals exactly one S2 HTTP
+// request (perPage caps at 100 inside listPapers) — that keeps the
+// per-build budget accounting honest. The trade-off is that papers with
+// 100+ refs only contribute their first page, which is well past the
+// signal needed for biblio coupling and Salton normalisation anyway.
 func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id string, p *Paper, fields []string) {
 	if p == nil || len(p.References) > 0 || !requestsReferences(fields) {
 		return
@@ -373,7 +379,7 @@ func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id 
 	if !ok {
 		return
 	}
-	refs, err := lister.GetReferences(ctx, id, 200, []string{"paperId", "externalIds"})
+	refs, err := lister.GetReferences(ctx, id, 100, []string{"paperId", "externalIds"})
 	if err != nil {
 		if r.Logger != nil {
 			r.Logger.Warn("tertiary: paginated refs supplement failed", "id", id, "err", err)

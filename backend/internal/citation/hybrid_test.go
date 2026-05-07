@@ -706,6 +706,12 @@ func TestResolvingTertiaryFallsBackToPaginatedRefsWhenInlineEmpty(t *testing.T) 
 	if len(inner.refCalls) != 1 {
 		t.Fatalf("paginated /references must be called once when inline empty, got %d", len(inner.refCalls))
 	}
+	// Limit must be ≤100 so listPapers issues a single HTTP request per
+	// fallback — otherwise one budget unit would silently consume two
+	// S2 RPS slots and the per-build cap would undercount actual cost.
+	if got := inner.refCalls[0].limit; got > 100 {
+		t.Errorf("/references limit must stay ≤100 for 1:1 budget accounting, got %d", got)
+	}
 	if len(p.References) != 2 {
 		t.Fatalf("want 2 translated refs (DOI + arxiv-synthesised), got %d: %+v", len(p.References), p.References)
 	}
