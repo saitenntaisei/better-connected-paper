@@ -737,17 +737,64 @@ func TestResolvingTertiarySkipsPaginatedRefsWhenInlinePresent(t *testing.T) {
 	}
 }
 
-// A wide first-hop with all-empty inline refs should not trigger more
-// than refsBackfillBudgetPerBatch paginated /references calls — otherwise
-// a 30+ paper batch at 1 RPS keyed would blow past the Vercel function
-// cap. Excess papers fall through with empty refs (logged once).
-func TestResolvingTertiaryBatchCapsPaginatedRefsFallback(t *testing.T) {
-	const inputs = refsBackfillBudgetPerBatch + 5
+// A per-build budget shared across multiple GetPaperBatch calls is what
+// keeps a chunked first-hop (BatchSize 100, MaxFirstHop 300) from firing
+// 6 × per-batch budgets in series and blowing the Vercel function cap.
+// Two consecutive batches drawing from the same WithRefsBackfillBudget
+// ctx must split the budget, not get a fresh allowance each.
+func TestResolvingTertiaryBatchCapsPaginatedRefsByBuildBudget(t *testing.T) {
+	const budget = 4
+	makeBatch := func(prefix string, n int) ([]string, []Paper) {
+		ids := make([]string, n)
+		ps := make([]Paper, n)
+		for i := 0; i < n; i++ {
+			ids[i] = fmt.Sprintf("%s%d", prefix, i)
+			ps[i] = Paper{PaperID: ids[i]}
+		}
+		return ids, ps
+	}
+	idsA, papersA := makeBatch("a", 3)
+	idsB, papersB := makeBatch("b", 5) // total 8 empty-refs across two batches
+	stubResp := map[string][]Paper{"A": papersA, "B": papersB}
+	currentLabel := ""
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
+			return stubResp[currentLabel], nil
+		}},
+		refs: func(ctx context.Context, id string, limit int, fields []string) ([]Paper, error) {
+			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/" + id}}}, nil
+		},
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}}
+	ctx := WithRefsBackfillBudget(context.Background(), budget)
+	currentLabel = "A"
+	if _, err := r.GetPaperBatch(ctx, idsA, []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	currentLabel = "B"
+	if _, err := r.GetPaperBatch(ctx, idsB, []string{"paperId", "references.paperId"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(inner.refCalls); got != budget {
+		t.Errorf("paginated /references calls across two batches: got %d, want %d (budget shared)", got, budget)
+	}
+}
+
+// Without a budget attached the fallback is unbounded — preserve the
+// pre-cap behaviour for non-Builder callers (CLI scripts, tests).
+func TestResolvingTertiaryBatchPaginatedRefsUnboundedWithoutBudget(t *testing.T) {
+	const inputs = 25
 	ids := make([]string, inputs)
 	stubPapers := make([]Paper, inputs)
 	for i := 0; i < inputs; i++ {
 		ids[i] = fmt.Sprintf("hex%d", i)
-		stubPapers[i] = Paper{PaperID: ids[i]} // empty References
+		stubPapers[i] = Paper{PaperID: ids[i]}
 	}
 	inner := &stubRefLister{
 		stubProvider: stubProvider{getBatch: func(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
@@ -767,8 +814,8 @@ func TestResolvingTertiaryBatchCapsPaginatedRefsFallback(t *testing.T) {
 	if _, err := r.GetPaperBatch(context.Background(), ids, []string{"paperId", "references.paperId"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(inner.refCalls); got != refsBackfillBudgetPerBatch {
-		t.Errorf("paginated /references calls: got %d, want %d (budget cap)", got, refsBackfillBudgetPerBatch)
+	if got := len(inner.refCalls); got != inputs {
+		t.Errorf("without budget all empty-refs should fall through, got %d / %d", got, inputs)
 	}
 }
 

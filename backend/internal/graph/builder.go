@@ -105,6 +105,13 @@ type Builder struct {
 	// roughly Connected-Papers' density. Raising it grows the graph
 	// quadratically so prefer adjusting threshold for noisier domains.
 	EmbeddingTopK int
+
+	// RefsBackfillBudget caps total paginated /references fallback calls
+	// per build (across firstHop / bridges / full fetch chunks). Default
+	// 20 — at 1 RPS keyed that's ≈20 s, comfortably below the Vercel 60 s
+	// function cap once /paper, /recs, and /embedding calls are added in.
+	// Set negative to disable the cap (unbounded).
+	RefsBackfillBudget int
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -161,6 +168,10 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		ctx, cancel = context.WithTimeout(ctx, b.Timeout)
 		defer cancel()
 	}
+	// Cap the per-build paginated /references fallback so a wide first-hop
+	// chunked across multiple GetPaperBatch calls can't stack 60 s of
+	// 1-RPS calls and blow the Vercel function cap.
+	ctx = citation.WithRefsBackfillBudget(ctx, b.refsBackfillBudget())
 	now := time.Now
 	if b.Now != nil {
 		now = b.Now
@@ -362,6 +373,19 @@ func (b *Builder) batchFetch(ctx context.Context, ids []string, fields []string)
 		out = append(out, batch...)
 	}
 	return out, nil
+}
+
+// refsBackfillBudget returns the per-build cap on paginated /references
+// fallback calls. Zero picks the default (20); negative disables.
+func (b *Builder) refsBackfillBudget() int {
+	switch {
+	case b.RefsBackfillBudget < 0:
+		return 0
+	case b.RefsBackfillBudget == 0:
+		return 20
+	default:
+		return b.RefsBackfillBudget
+	}
 }
 
 // recommendForSparseSeed asks the Recommender for topical neighbours

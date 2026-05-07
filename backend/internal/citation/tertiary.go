@@ -4,7 +4,45 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 )
+
+// refsBudgetKey scopes the per-build paginated-refs fallback budget so a
+// single Builder.Build can fan out across firstHop / bridges / full
+// fetches and still hit a hard total cap. Without this, a chunked batch
+// (BatchSize 100, MaxFirstHop 300) could fire the fallback in ~6
+// independent batches and stack ~60 s of /references calls onto the
+// 60 s Vercel function cap.
+type refsBudgetKey struct{}
+
+type refsBudget struct {
+	remaining int64
+}
+
+// WithRefsBackfillBudget caps how many paginated /references fallback
+// calls ResolvingTertiary may issue for any work rooted at ctx. n ≤ 0
+// disables the cap (unbounded). The budget is shared across goroutines
+// via atomic decrement, so concurrent batches drawing from the same ctx
+// can't double-spend.
+func WithRefsBackfillBudget(ctx context.Context, n int) context.Context {
+	if n <= 0 {
+		return ctx
+	}
+	b := &refsBudget{remaining: int64(n)}
+	return context.WithValue(ctx, refsBudgetKey{}, b)
+}
+
+// tryConsumeRefsBudget returns true if the caller may make one paginated
+// /references call. Falls back to "allow" when no budget is attached so
+// non-Builder callers (CLI tools, tests) keep their existing behaviour.
+func tryConsumeRefsBudget(ctx context.Context) bool {
+	v := ctx.Value(refsBudgetKey{})
+	b, ok := v.(*refsBudget)
+	if !ok || b == nil {
+		return true
+	}
+	return atomic.AddInt64(&b.remaining, -1) >= 0
+}
 
 // ResolvingTertiary wraps an inner PaperProvider (typically a Semantic
 // Scholar client) so its refs/cites come back in the primary's W-ID space
@@ -141,17 +179,6 @@ func (r *ResolvingTertiary) supplementCiters(ctx context.Context, id string, p *
 	}
 }
 
-// refsBackfillBudgetPerBatch caps how many per-paper paginated /references
-// calls one GetPaperBatch invocation will make. The fallback runs at the
-// inner provider's rate-limited speed (1 RPS keyed), so an unbounded
-// 30-paper first-hop would burn 30 s of build budget before the rest of
-// the pipeline runs. Builders can fire GetPaperBatch up to ~3 times per
-// build (firstHop, bridges, full fetch), so the effective worst-case
-// fallback time is ≈3 × budget × 1 s — chosen to stay within Vercel's
-// 60 s function cap with margin for the existing /paper, /recs, and
-// /embedding calls.
-const refsBackfillBudgetPerBatch = 10
-
 // GetPaperBatch fetches a batch of papers (IDs may be DOI:/ARXIV:/hex) via
 // the inner provider, then replaces each paper's hex refs with W-IDs using
 // the DOI resolver. Unlike GetPaper this does NOT supplement cites — cites
@@ -161,10 +188,10 @@ const refsBackfillBudgetPerBatch = 10
 // match returned papers back to their input DOIs.
 //
 // Papers whose inline refs came back empty get a per-paper paginated
-// /references fallback (same shape as GetPaper) so the batch doesn't
-// regress on the recent-arxiv preprint shape that motivated the fallback
-// in the first place. The fallback is capped at refsBackfillBudgetPerBatch
-// calls per batch so a wide first-hop can't time out the build.
+// /references fallback (same shape as GetPaper). Calls draw from the
+// per-build budget attached to ctx via WithRefsBackfillBudget, so a
+// chunked first-hop can't fire 6 × budget calls in series and time out
+// the build on Vercel.
 func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fields []string) ([]Paper, error) {
 	if r.Inner == nil {
 		return nil, nil
@@ -174,8 +201,7 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 		return papers, err
 	}
 	if requestsReferences(fields) {
-		calls := 0
-		skipped := 0
+		spent, skipped := 0, 0
 		for i := range papers {
 			if len(papers[i].References) > 0 {
 				continue
@@ -184,15 +210,15 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 			if id == "" {
 				continue
 			}
-			if calls >= refsBackfillBudgetPerBatch {
+			if !tryConsumeRefsBudget(ctx) {
 				skipped++
 				continue
 			}
 			r.supplementRefsViaPagination(ctx, id, &papers[i], fields)
-			calls++
+			spent++
 		}
 		if skipped > 0 && r.Logger != nil {
-			r.Logger.Info("tertiary: paginated refs fallback budget hit", "spent", calls, "skipped", skipped, "budget", refsBackfillBudgetPerBatch)
+			r.Logger.Info("tertiary: paginated refs fallback budget hit", "spent", spent, "skipped", skipped)
 		}
 	}
 	r.translateRefsBatch(ctx, papers)
