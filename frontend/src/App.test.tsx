@@ -120,4 +120,41 @@ describe("App", () => {
     });
     expect(buildCalls).toEqual(["first", "second"]);
   });
+
+  it("auto-switches edge mode to the only kind that has edges", async () => {
+    globalThis.fetch = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/graph/build") {
+          return json({
+            seed: { id: "S", title: "Seed", similarity: 0, isSeed: true },
+            nodes: [
+              { id: "S", title: "Seed", similarity: 0, isSeed: true },
+              { id: "A", title: "A", similarity: 0.6 },
+            ],
+            edges: [{ source: "A", target: "S", kind: "similarity", weight: 0.5 }],
+            builtAt: "2026-05-07T00:00:00Z",
+          });
+        }
+        if (url.startsWith("/api/paper/")) {
+          return json({ paperId: "S", title: "Seed" });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+    window.history.replaceState({}, "", "/?seed=S");
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toBeInTheDocument();
+    });
+    // Default mode is "cite", but the graph only has similarity edges, so the
+    // app must flip to similarity (otherwise toElements would render only the
+    // seed node — exactly the symptom Codex flagged).
+    const sim = screen.getByRole("radio", { name: /Similarity/ });
+    const cite = screen.getByRole("radio", { name: /Citations/ });
+    await waitFor(() => expect(sim).toHaveAttribute("aria-checked", "true"));
+    expect(cite).toHaveAttribute("aria-checked", "false");
+    expect(cite).toBeDisabled();
+  });
 });

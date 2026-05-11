@@ -8,6 +8,7 @@ import { Spinner } from "./components/Spinner";
 import { useSearch } from "./hooks/useSearch";
 import { useGraph } from "./hooks/useGraph";
 import { useUrlSeed } from "./hooks/useUrlSeed";
+import type { EdgeMode } from "./lib/graphElements";
 import type { SearchResult } from "./types/api";
 
 export default function App() {
@@ -16,7 +17,31 @@ export default function App() {
   const { seed: urlSeed, setSeed: setUrlSeed, hasPushedEntry } = useUrlSeed();
 
   const [focusId, setFocusId] = useState<string | null>(urlSeed);
-  const [showSimilarity, setShowSimilarity] = useState(true);
+  // edgeMode is the user's preferred edge layer. effectiveEdgeMode below
+  // overrides it when the active graph has no edges of that kind — a
+  // sparse arxiv seed whose neighbourhood is similarity-only would
+  // otherwise render as just the seed dot under the default "cite".
+  const [edgeMode, setEdgeMode] = useState<EdgeMode>("cite");
+
+  const edgeCounts = useMemo(() => {
+    if (graphState.status !== "success") return { cite: 0, similarity: 0 };
+    const c = { cite: 0, similarity: 0 };
+    for (const e of graphState.data.edges) {
+      if (e.kind === "cite") c.cite++;
+      else if (e.kind === "similarity") c.similarity++;
+    }
+    return c;
+  }, [graphState]);
+
+  const effectiveEdgeMode = useMemo<EdgeMode>(() => {
+    if (edgeMode === "cite" && edgeCounts.cite === 0 && edgeCounts.similarity > 0) {
+      return "similarity";
+    }
+    if (edgeMode === "similarity" && edgeCounts.similarity === 0 && edgeCounts.cite > 0) {
+      return "cite";
+    }
+    return edgeMode;
+  }, [edgeMode, edgeCounts]);
 
   // Reset the detail-panel focus whenever the seed changes — including the
   // popstate case, which updates urlSeed without going through selectSeed.
@@ -74,14 +99,32 @@ export default function App() {
             <span className="eyebrow">Citation graph ·</span>
             <span className="seed-title">{seedTitle}</span>
           </h2>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={showSimilarity}
-              onChange={(e) => setShowSimilarity(e.target.checked)}
-            />
-            Show similarity links
-          </label>
+          <div className="edge-mode-toggle" role="radiogroup" aria-label="Edge type">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={effectiveEdgeMode === "cite"}
+              aria-label={`Citations (${edgeCounts.cite})`}
+              className={effectiveEdgeMode === "cite" ? "is-active" : undefined}
+              disabled={edgeCounts.cite === 0}
+              onClick={() => setEdgeMode("cite")}
+            >
+              Citations
+              <span className="edge-mode-count">{edgeCounts.cite}</span>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={effectiveEdgeMode === "similarity"}
+              aria-label={`Similarity (${edgeCounts.similarity})`}
+              className={effectiveEdgeMode === "similarity" ? "is-active" : undefined}
+              disabled={edgeCounts.similarity === 0}
+              onClick={() => setEdgeMode("similarity")}
+            >
+              Similarity
+              <span className="edge-mode-count">{edgeCounts.similarity}</span>
+            </button>
+          </div>
         </div>
         <div className="graph-page-body">
           <div className="graph-main">
@@ -102,7 +145,7 @@ export default function App() {
               <Graph
                 data={graphState.data}
                 onSelectNode={setFocusId}
-                showSimilarity={showSimilarity}
+                edgeMode={effectiveEdgeMode}
               />
             )}
           </div>

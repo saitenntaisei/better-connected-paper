@@ -904,6 +904,58 @@ button {
   background: var(--card);
 }
 
+.edge-mode-toggle {
+  display: inline-flex;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  border: 1px solid var(--rule-strong);
+  background: var(--paper-warm);
+}
+
+.edge-mode-toggle button {
+  appearance: none;
+  background: transparent;
+  border: none;
+  padding: 0.4rem 0.85rem;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  transition: background 180ms ease, color 180ms ease;
+}
+
+.edge-mode-toggle button + button {
+  border-left: 1px solid var(--rule-strong);
+}
+
+.edge-mode-toggle button:hover:not(.is-active) {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.edge-mode-toggle button.is-active {
+  background: var(--accent);
+  color: var(--card);
+}
+
+.edge-mode-toggle button[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.edge-mode-toggle .edge-mode-count {
+  margin-left: 0.5rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+}
+
+.edge-mode-toggle button.is-active .edge-mode-count {
+  opacity: 1;
+}
+
 /* ========================================================
    Colophon / footer
    ======================================================== */

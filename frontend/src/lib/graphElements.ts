@@ -6,8 +6,17 @@ export type ElementData = {
   yearRange: [number, number];
 };
 
+export type EdgeMode = "cite" | "similarity";
+
 export type ElementOptions = {
-  includeSimilarity?: boolean;
+  /**
+   * Which edge layer to surface — exclusive choice rather than a both-on
+   * overlay, because the recs+ar5iv pipeline now produces enough of each
+   * kind that drawing them simultaneously becomes visually unreadable
+   * (≈250 cite + 400 similarity edges on a 40-node sparse-seed build).
+   * Defaults to `"cite"` to match the project's directed-graph framing.
+   */
+  edgeMode?: EdgeMode;
 };
 
 /**
@@ -26,18 +35,15 @@ export function toElements(
   const maxYear = years.length ? Math.max(...years) : 2020;
 
   const elements: ElementDefinition[] = [];
-  const includeSimilarity = opts.includeSimilarity ?? true;
+  const edgeMode: EdgeMode = opts.edgeMode ?? "cite";
 
-  const keepNode = (() => {
-    if (includeSimilarity) return () => true;
-    const citeEndpoints = new Set<string>();
-    for (const e of response.edges) {
-      if (e.kind !== "cite") continue;
-      citeEndpoints.add(e.source);
-      citeEndpoints.add(e.target);
-    }
-    return (n: GraphNode) => n.isSeed === true || citeEndpoints.has(n.id);
-  })();
+  const endpoints = new Set<string>();
+  for (const e of response.edges) {
+    if (e.kind !== edgeMode) continue;
+    endpoints.add(e.source);
+    endpoints.add(e.target);
+  }
+  const keepNode = (n: GraphNode) => n.isSeed === true || endpoints.has(n.id);
 
   for (const n of response.nodes) {
     if (!keepNode(n)) continue;
@@ -66,7 +72,7 @@ export function toElements(
   const simMax = simWeights.length ? Math.max(...simWeights) : 1;
 
   for (const e of response.edges) {
-    if (e.kind === "similarity" && !includeSimilarity) continue;
+    if (e.kind !== edgeMode) continue;
     const weight = e.weight ?? 1;
     const data: Record<string, unknown> = {
       id: edgeId(e),
