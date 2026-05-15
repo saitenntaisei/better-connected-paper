@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -651,9 +652,12 @@ func TestResolvingTertiaryDoesNotEnrichWhenCallerDidNotAsk(t *testing.T) {
 
 // stubRefLister is a stubProvider that also satisfies referencePager so
 // tests can wire ResolvingTertiary's single-page /references fallback.
+// Concurrent callers (the batch supplement now spawns one goroutine per
+// paper) share refCalls — the mutex keeps the slice append race-free.
 type stubRefLister struct {
 	stubProvider
 	refs     func(ctx context.Context, id string, fields []string) ([]Paper, error)
+	mu       sync.Mutex
 	refCalls []refCall
 }
 
@@ -662,7 +666,9 @@ type refCall struct {
 }
 
 func (s *stubRefLister) GetReferencesSinglePage(ctx context.Context, id string, fields []string) ([]Paper, error) {
+	s.mu.Lock()
 	s.refCalls = append(s.refCalls, refCall{id: id})
+	s.mu.Unlock()
 	if s.refs == nil {
 		return nil, nil
 	}
@@ -840,6 +846,100 @@ func (s *stubAr5iv) GetReferences(ctx context.Context, arxivID string) ([]Paper,
 // tertiary must then reach for ar5iv to recover the bibliography from
 // the LaTeX-rendered HTML and translate it through the existing
 // resolver chain.
+// For arxiv preprints we skip S2 paginated /references and go straight
+// to ar5iv: the publisher-elision rate on the paginated endpoint is high
+// enough that the round-trip is mostly wasted, and ar5iv lives on its
+// own rate limiter. The pager must not be consulted at all when ar5iv
+// supplies refs successfully.
+func TestResolvingTertiarySkipsPaginatedForArxivPaperWithAr5iv(t *testing.T) {
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:     "S2HEX",
+				ExternalIDs: ExternalIDs{"ArXiv": "2511.99999"},
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			t.Fatalf("paginated /references must not fire for arxiv preprints when ar5iv is wired")
+			return nil, nil
+		},
+	}
+	ar5iv := &stubAr5iv{
+		fn: func(ctx context.Context, arxivID string) ([]Paper, error) {
+			return []Paper{
+				{ExternalIDs: ExternalIDs{"ArXiv": "2502.13923"}},
+				{ExternalIDs: ExternalIDs{"ArXiv": "2503.17434"}},
+			}, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver, Ar5iv: ar5iv}
+
+	p, err := r.GetPaper(context.Background(), "ARXIV:2511.99999", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ar5iv.calls) != 1 || ar5iv.calls[0] != "2511.99999" {
+		t.Fatalf("ar5iv must be called once with the seed arxiv id, got %v", ar5iv.calls)
+	}
+	if len(inner.refCalls) != 0 {
+		t.Errorf("paginated /references must be skipped for arxiv preprints, got %d calls", len(inner.refCalls))
+	}
+	if len(p.References) != 2 {
+		t.Errorf("want 2 translated refs from ar5iv, got %d: %+v", len(p.References), p.References)
+	}
+}
+
+// When ar5iv returns empty for an arxiv preprint (rendering failure /
+// missing page), we still fall back to S2 paginated rather than giving
+// up — that's the original cascade that PR #30 introduced.
+func TestResolvingTertiaryFallsBackToPaginatedWhenAr5ivEmptyForArxiv(t *testing.T) {
+	inner := &stubRefLister{
+		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:     "S2HEX",
+				ExternalIDs: ExternalIDs{"ArXiv": "2511.99999"},
+			}, nil
+		}},
+		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
+			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/x"}}}, nil
+		},
+	}
+	ar5iv := &stubAr5iv{
+		fn: func(ctx context.Context, arxivID string) ([]Paper, error) {
+			return nil, nil
+		},
+	}
+	resolver := func(ctx context.Context, dois []string) ([]Paper, error) {
+		out := make([]Paper, 0, len(dois))
+		for _, d := range dois {
+			out = append(out, Paper{PaperID: "W_" + d})
+		}
+		return out, nil
+	}
+	r := &ResolvingTertiary{Inner: inner, Resolver: resolver, Ar5iv: ar5iv}
+
+	p, err := r.GetPaper(context.Background(), "ARXIV:2511.99999", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ar5iv.calls) != 1 {
+		t.Fatalf("ar5iv must be tried first, got %d calls", len(ar5iv.calls))
+	}
+	if len(inner.refCalls) != 1 {
+		t.Errorf("S2 paginated must fall back when ar5iv comes back empty, got %d calls", len(inner.refCalls))
+	}
+	if len(p.References) != 1 {
+		t.Errorf("want 1 ref from paginated fallback, got %d: %+v", len(p.References), p.References)
+	}
+}
+
 func TestResolvingTertiaryAr5ivFallbackWhenPaginatedEmpty(t *testing.T) {
 	inner := &stubRefLister{
 		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
@@ -881,13 +981,15 @@ func TestResolvingTertiaryAr5ivFallbackWhenPaginatedEmpty(t *testing.T) {
 	}
 }
 
-// When S2 paginated already returned refs, the ar5iv fallback shouldn't
-// fire — paying for an extra HTTP request and budget unit is wasteful
-// when the cheaper path already succeeded.
-func TestResolvingTertiaryAr5ivSkippedWhenPaginatedHasRefs(t *testing.T) {
+// For non-arxiv papers (DOI but no ArXiv id) the original ordering still
+// applies: try S2 paginated first, fall back to ar5iv only when it
+// returns nothing. Paying for ar5iv is wasted when paginated already
+// produced refs, and arxivIDFromPaper returns "" so the ar5iv-first
+// arxiv shortcut doesn't trigger here.
+func TestResolvingTertiaryAr5ivSkippedWhenPaginatedHasRefsForNonArxiv(t *testing.T) {
 	inner := &stubRefLister{
 		stubProvider: stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
-			return &Paper{PaperID: "S2HEX", ExternalIDs: ExternalIDs{"ArXiv": "2511.99999"}}, nil
+			return &Paper{PaperID: "S2HEX", ExternalIDs: ExternalIDs{"DOI": "10.1/journal"}}, nil
 		}},
 		refs: func(ctx context.Context, id string, fields []string) ([]Paper, error) {
 			return []Paper{{ExternalIDs: ExternalIDs{"DOI": "10.1/a"}}}, nil
@@ -895,7 +997,7 @@ func TestResolvingTertiaryAr5ivSkippedWhenPaginatedHasRefs(t *testing.T) {
 	}
 	ar5iv := &stubAr5iv{
 		fn: func(ctx context.Context, arxivID string) ([]Paper, error) {
-			t.Fatalf("ar5iv must not fire when paginated /references supplied refs")
+			t.Fatalf("ar5iv must not fire for non-arxiv papers when paginated has refs")
 			return nil, nil
 		},
 	}
@@ -904,11 +1006,14 @@ func TestResolvingTertiaryAr5ivSkippedWhenPaginatedHasRefs(t *testing.T) {
 	}
 	r := &ResolvingTertiary{Inner: inner, Resolver: resolver, Ar5iv: ar5iv}
 
-	if _, err := r.GetPaper(context.Background(), "ARXIV:2511.99999", []string{"paperId", "references.paperId"}); err != nil {
+	if _, err := r.GetPaper(context.Background(), "DOI:10.1/journal", []string{"paperId", "references.paperId"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(ar5iv.calls) != 0 {
 		t.Fatalf("ar5iv called %d times, want 0", len(ar5iv.calls))
+	}
+	if len(inner.refCalls) != 1 {
+		t.Errorf("paginated /references must be called once, got %d", len(inner.refCalls))
 	}
 }
 

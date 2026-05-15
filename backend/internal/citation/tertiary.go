@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -210,7 +211,14 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 		return papers, err
 	}
 	if requestsReferences(fields) {
-		spent, skipped := 0, 0
+		var wg sync.WaitGroup
+		var spent, skipped atomic.Int32
+		// S2 paginated and ar5iv each enforce their own rate limiter, so
+		// firing every empty-refs paper concurrently lets the two APIs
+		// progress in parallel — wall-clock collapses from
+		// N × (S2_lat + ar5iv_lat) to roughly max(N/S2_RPS, N/ar5iv_RPS).
+		// supplementRefsViaPagination only mutates its own *Paper, so the
+		// goroutines don't race on shared state aside from budget counters.
 		for i := range papers {
 			if len(papers[i].References) > 0 {
 				continue
@@ -220,14 +228,19 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 				continue
 			}
 			if !tryConsumeRefsBudget(ctx) {
-				skipped++
+				skipped.Add(1)
 				continue
 			}
-			r.supplementRefsViaPagination(ctx, id, &papers[i], fields)
-			spent++
+			spent.Add(1)
+			wg.Add(1)
+			go func(p *Paper, id string) {
+				defer wg.Done()
+				r.supplementRefsViaPagination(ctx, id, p, fields)
+			}(&papers[i], id)
 		}
-		if skipped > 0 && r.Logger != nil {
-			r.Logger.Info("tertiary: paginated refs fallback budget hit", "spent", spent, "skipped", skipped)
+		wg.Wait()
+		if s := skipped.Load(); s > 0 && r.Logger != nil {
+			r.Logger.Info("tertiary: paginated refs fallback budget hit", "spent", spent.Load(), "skipped", s)
 		}
 	}
 	r.translateRefsBatch(ctx, papers)
@@ -398,6 +411,18 @@ func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id 
 		r.fillRefsFromAr5iv(ctx, id, p)
 		return
 	}
+	// For arxiv preprints the publisher-elision rate on S2's paginated
+	// /references is high enough that the per-paper round-trip is
+	// usually wasted — ~30/32 misses in the AsyncVLA cluster. Skip
+	// straight to ar5iv (separate rate limiter, much higher hit rate
+	// for preprints) and only fall back to S2 paginated when ar5iv
+	// didn't deliver. Non-arxiv papers keep the original ordering.
+	if r.Ar5iv != nil && arxivIDFromPaper(p, id) != "" {
+		r.fillRefsFromAr5iv(ctx, id, p)
+		if len(p.References) > 0 {
+			return
+		}
+	}
 	refs, err := pager.GetReferencesSinglePage(ctx, id, []string{"paperId", "externalIds"})
 	if err != nil {
 		if r.Logger != nil {
@@ -469,8 +494,8 @@ func arxivIDFromPaper(p *Paper, id string) string {
 			return a
 		}
 		doi := strings.ToLower(strings.TrimSpace(p.ExternalIDs["DOI"]))
-		if strings.HasPrefix(doi, "10.48550/arxiv.") {
-			return strings.TrimPrefix(doi, "10.48550/arxiv.")
+		if rest, ok := strings.CutPrefix(doi, "10.48550/arxiv."); ok {
+			return rest
 		}
 	}
 	if id != "" {

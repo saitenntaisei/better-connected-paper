@@ -52,10 +52,13 @@ func NewAr5ivClient(opts Ar5ivOptions) *Ar5ivClient {
 		opts.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	if opts.RPS == 0 {
-		opts.RPS = 1.0
+		// 3 RPS keeps cold sparse-seed builds well under one S2 rate-limit
+		// window per paper without straining the ar5iv-labs service —
+		// individual builds use ≤30 ar5iv calls total.
+		opts.RPS = 3.0
 	}
 	if opts.Burst == 0 {
-		opts.Burst = 2
+		opts.Burst = 5
 	}
 	return &Ar5ivClient{
 		httpClient: opts.HTTPClient,
