@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -31,11 +32,15 @@ type Cache interface {
 	GetPapersWithLinks(ctx context.Context, ids []string) ([]citation.Paper, error)
 	UpsertPapers(ctx context.Context, papers []citation.Paper) error
 	ReplacePaperLinks(ctx context.Context, paperID string, refs, cites []string) error
-	// InvalidateGraph drops the cached JSON payload for a seed so the next
-	// /api/graph/build request rebuilds with whatever fresh paper_links the
-	// deferred-ar5iv background pass populated. Optional on the interface
-	// (a nil store implementation can leave this as a no-op).
+	// InvalidateGraph drops the cached JSON payload for a seed.
 	InvalidateGraph(ctx context.Context, seedID string) error
+	// StoreGraph replaces the cached JSON payload for a seed. Used by the
+	// deferred-ar5iv background goroutine: after rerunning Build with
+	// full supplements, the enriched graph is written here directly so
+	// the next /api/graph/build request returns it from the cache
+	// instead of rebuilding (turns refresh into an instant cache hit
+	// rather than the ~10 s rebuild it would otherwise take).
+	StoreGraph(ctx context.Context, seedID string, payload []byte) error
 }
 
 // Builder constructs the directed graph around a seed paper.
@@ -140,15 +145,17 @@ var seedFields = []string{
 }
 
 // minimalLinkFields is the cheap fetch used to explore the 1-hop cloud:
-// paper id plus the id lists we need for scoring. No title/abstract/etc.,
-// so the response size stays linear in |refs|+|cites| rather than quadratic.
-// citationCount is required by CoCitationApprox as the Salton denominator
-// scale for each candidate; without it the coCite term collapses to 0.
+// paper id, citationCount (the Salton denominator scale for the coCite
+// term — without it the coCite score collapses to 0), and the refs id
+// list. Cites are NOT requested here: rank, twoHopSupport, and the
+// final cite-edge construction all read from firstHop's *refs* (not
+// cites), and asking OpenAlex for citations.paperId triggers a per-paper
+// /works?filter=cites: enrichment call that costs ~3 s across a 30-paper
+// first hop for no scoring or edge value.
 var minimalLinkFields = []string{
 	"paperId",
 	"citationCount",
 	"references.paperId",
-	"citations.paperId",
 }
 
 // bridgeLinkFields is the metadata fetch used for 2-hop bridge candidates.
@@ -249,15 +256,26 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 
 	// Bridge candidates: 2-hop papers with enough first-hop support to be
 	// worth hydrating. Capped to avoid a blow-out for high-degree seeds.
-	bridgeIDs := selectBridgeIDs(twoHopSupport, b.TwoHopSupport, b.MaxBridgeCandidates)
-	if seedAlias != "" {
-		bridgeIDs = filterOut(bridgeIDs, seedAlias)
+	// In deferred-ar5iv mode the initial response skips bridges entirely
+	// — recs + seed-cites already provide ~30 candidates, the embedding
+	// layer wires similarity edges between them, and an extra
+	// MaxBridgeCandidates batch fetch on the hot path adds ~3 s for
+	// nodes that mostly fall outside the top-MaxNodes cut anyway. The
+	// forced-sync background rerun (citation.IsForceSyncAr5iv) restores
+	// bridges so the enriched cached graph includes them on refresh.
+	var bridges []citation.Paper
+	if !deferAr5iv {
+		bridgeIDs := selectBridgeIDs(twoHopSupport, b.TwoHopSupport, b.MaxBridgeCandidates)
+		if seedAlias != "" {
+			bridgeIDs = filterOut(bridgeIDs, seedAlias)
+		}
+		var bErr error
+		bridges, bErr = b.fetchWithCache(ctx, bridgeIDs, bridgeLinkFields)
+		if bErr != nil {
+			return nil, fmt.Errorf("fetch two-hop bridges: %w", bErr)
+		}
+		canonicalizeSeedAlias(bridges, seedAlias, seed.PaperID)
 	}
-	bridges, err := b.fetchWithCache(ctx, bridgeIDs, bridgeLinkFields)
-	if err != nil {
-		return nil, fmt.Errorf("fetch two-hop bridges: %w", err)
-	}
-	canonicalizeSeedAlias(bridges, seedAlias, seed.PaperID)
 	bridgesByID := indexPapers(bridges)
 
 	scored := rankCandidates(seed, firstHop, bridges)
@@ -298,7 +316,16 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		}
 	}
 	fullByID := indexPapers(full)
-	b.persistFetched(ctx, seed, full)
+	// Skip persistence in deferred-ar5iv FG: this run's papers carry
+	// sparse refs (per-paper supplements were intentionally bypassed),
+	// and persisting them would let the background rerun's
+	// fetchWithCache treat the half-populated rows as cache hits and
+	// shadow the ar5iv work the BG specifically came back to do. The
+	// forced-sync BG path re-persists with full supplements, so the
+	// cache ends up with the enriched state on refresh.
+	if !deferAr5iv {
+		b.persistFetched(ctx, seed, full)
+	}
 
 	nodes := make([]Node, 0, len(scored)+1)
 	seedNode := ToNode(*seed)
@@ -359,10 +386,13 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 }
 
 // spawnDeferredAr5iv re-runs Build with ar5iv forced on, in a goroutine
-// rooted at a fresh context so it outlives the original request. After
-// the rerun, the cached graphs row for seedID is invalidated so the next
-// /api/graph/build request rebuilds against the now-populated
-// paper_links cache and returns the enriched cite-arrow graph.
+// rooted at a fresh context so it outlives the original request. The
+// enriched Response is then written back to the graphs cache so the
+// next /api/graph/build request returns it from the cache as an
+// instant hit — refresh used to pay a ~10 s rebuild even after the
+// background populated paper_links, because the rebuild still had to
+// walk every fetch / rank / edge phase. Writing the enriched payload
+// here turns that refresh into a pure cache hit.
 func (b *Builder) spawnDeferredAr5iv(seedID string) {
 	go func() {
 		bgCtx, cancel := context.WithTimeout(citation.WithForceSyncAr5iv(context.Background()), 3*time.Minute)
@@ -370,15 +400,23 @@ func (b *Builder) spawnDeferredAr5iv(seedID string) {
 		if b.Logger != nil {
 			b.Logger.Info("deferred ar5iv backfill: starting", "seed", seedID)
 		}
-		if _, err := b.Build(bgCtx, seedID); err != nil {
+		resp, err := b.Build(bgCtx, seedID)
+		if err != nil {
 			if b.Logger != nil {
 				b.Logger.Warn("deferred ar5iv backfill: build failed", "seed", seedID, "err", err)
 			}
 			return
 		}
-		if b.Cache != nil {
-			if err := b.Cache.InvalidateGraph(bgCtx, seedID); err != nil && b.Logger != nil {
-				b.Logger.Warn("deferred ar5iv backfill: invalidate graph failed", "seed", seedID, "err", err)
+		if b.Cache != nil && resp != nil {
+			payload, mErr := json.Marshal(resp)
+			if mErr != nil {
+				if b.Logger != nil {
+					b.Logger.Warn("deferred ar5iv backfill: marshal failed", "seed", seedID, "err", mErr)
+				}
+				return
+			}
+			if sErr := b.Cache.StoreGraph(bgCtx, seedID, payload); sErr != nil && b.Logger != nil {
+				b.Logger.Warn("deferred ar5iv backfill: store graph failed", "seed", seedID, "err", sErr)
 			}
 		}
 		if b.Logger != nil {
