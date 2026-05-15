@@ -674,6 +674,8 @@ func (c *stubCache) UpsertPapers(_ context.Context, papers []citation.Paper) err
 	return nil
 }
 
+func (c *stubCache) InvalidateGraph(_ context.Context, _ string) error { return nil }
+
 func (c *stubCache) ReplacePaperLinks(_ context.Context, paperID string, refs, cites []string) error {
 	if c.links == nil {
 		c.links = map[string][2][]string{}

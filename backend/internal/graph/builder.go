@@ -31,6 +31,11 @@ type Cache interface {
 	GetPapersWithLinks(ctx context.Context, ids []string) ([]citation.Paper, error)
 	UpsertPapers(ctx context.Context, papers []citation.Paper) error
 	ReplacePaperLinks(ctx context.Context, paperID string, refs, cites []string) error
+	// InvalidateGraph drops the cached JSON payload for a seed so the next
+	// /api/graph/build request rebuilds with whatever fresh paper_links the
+	// deferred-ar5iv background pass populated. Optional on the interface
+	// (a nil store implementation can leave this as a no-op).
+	InvalidateGraph(ctx context.Context, seedID string) error
 }
 
 // Builder constructs the directed graph around a seed paper.
@@ -112,6 +117,16 @@ type Builder struct {
 	// function cap once /paper, /recs, and /embedding calls are added in.
 	// Set negative to disable the cap (unbounded).
 	RefsBackfillBudget int
+
+	// DeferAr5iv runs the initial Build with ar5iv suppressed (the user
+	// gets the recs + embedding-similarity layer immediately, in ≈7 s
+	// instead of ≈15 s), then spawns a background goroutine that reruns
+	// the build with ar5iv enabled so the next /api/graph/build request
+	// for the same seed serves the enriched cite-arrow graph from the
+	// paper_links cache. Set false to keep ar5iv inline (correct, just
+	// slower) — Vercel-style serverless deployments where a goroutine
+	// can't outlive the response should leave this off.
+	DeferAr5iv bool
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -179,6 +194,16 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	// chunked across multiple GetPaperBatch calls can't stack 60 s of
 	// 1-RPS calls and blow the Vercel function cap.
 	ctx = citation.WithRefsBackfillBudget(ctx, b.refsBackfillBudget())
+
+	// Deferred-ar5iv mode: drop ar5iv from the sync path, then spawn a
+	// background re-build (with ar5iv forced on) and invalidate the
+	// cached graphs payload so the next request rebuilds against the
+	// freshly populated paper_links rows. The background goroutine
+	// itself bypasses defer via IsForceSyncAr5iv to avoid recursion.
+	deferAr5iv := b.DeferAr5iv && !citation.IsForceSyncAr5iv(ctx)
+	if deferAr5iv {
+		ctx = citation.WithSkipAr5iv(ctx, true)
+	}
 	now := time.Now
 	if b.Now != nil {
 		now = b.Now
@@ -321,12 +346,45 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 
 	nodes, edges = pruneOrphanNodes(seedNode.ID, nodes, edges)
 
+	if deferAr5iv {
+		b.spawnDeferredAr5iv(seedID)
+	}
+
 	return &Response{
 		Seed:    seedNode,
 		Nodes:   nodes,
 		Edges:   edges,
 		BuiltAt: now().UTC(),
 	}, nil
+}
+
+// spawnDeferredAr5iv re-runs Build with ar5iv forced on, in a goroutine
+// rooted at a fresh context so it outlives the original request. After
+// the rerun, the cached graphs row for seedID is invalidated so the next
+// /api/graph/build request rebuilds against the now-populated
+// paper_links cache and returns the enriched cite-arrow graph.
+func (b *Builder) spawnDeferredAr5iv(seedID string) {
+	go func() {
+		bgCtx, cancel := context.WithTimeout(citation.WithForceSyncAr5iv(context.Background()), 3*time.Minute)
+		defer cancel()
+		if b.Logger != nil {
+			b.Logger.Info("deferred ar5iv backfill: starting", "seed", seedID)
+		}
+		if _, err := b.Build(bgCtx, seedID); err != nil {
+			if b.Logger != nil {
+				b.Logger.Warn("deferred ar5iv backfill: build failed", "seed", seedID, "err", err)
+			}
+			return
+		}
+		if b.Cache != nil {
+			if err := b.Cache.InvalidateGraph(bgCtx, seedID); err != nil && b.Logger != nil {
+				b.Logger.Warn("deferred ar5iv backfill: invalidate graph failed", "seed", seedID, "err", err)
+			}
+		}
+		if b.Logger != nil {
+			b.Logger.Info("deferred ar5iv backfill: completed", "seed", seedID)
+		}
+	}()
 }
 
 // pruneOrphanNodes drops non-seed nodes that participate in zero edges. Such
