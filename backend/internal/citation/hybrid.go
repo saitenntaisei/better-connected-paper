@@ -67,9 +67,17 @@ func (h *HybridClient) GetPaper(ctx context.Context, id string, fields []string)
 	// layer don't block later layers — a sick secondary shouldn't veto a
 	// healthy tertiary.
 	current := p
+	skipSecondary := isArxivPaper(current)
 	for _, layer := range h.supplementChain() {
 		if !h.needsSupplement(current, fields) {
 			break
+		}
+		if skipSecondary && layer.label == "secondary" {
+			// OpenCitations doesn't index arxiv preprints — every
+			// secondary call on an arxiv DOI returns "non-narrowing" and
+			// just costs a serial round-trip on the seed-fetch path.
+			// Skip ahead so tertiary (S2 + ar5iv) starts ~1-2 s sooner.
+			continue
 		}
 		if merged := h.trySupplement(ctx, current, id, fields, layer.provider, layer.label); merged != nil {
 			current = merged
@@ -80,6 +88,22 @@ func (h *HybridClient) GetPaper(ctx context.Context, id string, fields []string)
 		h.Logger.Warn("hybrid: no supplement match found", "id", id, "title", p.Title)
 	}
 	return current, nil
+}
+
+// isArxivPaper reports whether a paper looks like an arxiv preprint —
+// either it carries an ArXiv external id or its DOI lives under the
+// 10.48550/arxiv. prefix arxiv mints for new preprints. Used to skip
+// supplement providers (OpenCitations) that demonstrably never have
+// data for arxiv preprints.
+func isArxivPaper(p *Paper) bool {
+	if p == nil {
+		return false
+	}
+	if strings.TrimSpace(p.ExternalIDs["ArXiv"]) != "" {
+		return true
+	}
+	doi := strings.ToLower(strings.TrimSpace(p.ExternalIDs["DOI"]))
+	return strings.HasPrefix(doi, "10.48550/arxiv.")
 }
 
 type supplementLayer struct {

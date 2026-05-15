@@ -96,9 +96,14 @@ func TestHybridSupplementsEmptyRefs(t *testing.T) {
 	primary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
 		return &Paper{
 			PaperID:        "W1",
-			Title:          "Octo-ish",
+			Title:          "Conference paper",
 			ReferenceCount: 50,
-			ExternalIDs:    ExternalIDs{"DOI": "10.48550/arXiv.2405.12213"},
+			// Non-arxiv DOI keeps OpenCitations in the supplement chain.
+			// Hybrid skips secondary for arxiv preprints because the
+			// OpenCitations corpus doesn't index them, so this test
+			// pins the secondary-supplements-refs path on a paper that
+			// genuinely benefits from secondary coverage.
+			ExternalIDs: ExternalIDs{"DOI": "10.1109/cvpr.2024.99999"},
 		}, nil
 	}}
 	var secondaryID string
@@ -118,14 +123,48 @@ func TestHybridSupplementsEmptyRefs(t *testing.T) {
 	if p.PaperID != "W1" {
 		t.Fatalf("PaperID must stay primary W1, got %q", p.PaperID)
 	}
-	if p.Title != "Octo-ish" {
+	if p.Title != "Conference paper" {
 		t.Fatalf("primary metadata must survive merge, got title %q", p.Title)
 	}
 	if len(p.References) != 3 {
 		t.Fatalf("refs must come from secondary, got %d", len(p.References))
 	}
-	if secondaryID != "DOI:10.48550/arXiv.2405.12213" {
+	if secondaryID != "DOI:10.1109/cvpr.2024.99999" {
 		t.Fatalf("secondary lookup id wrong: %q", secondaryID)
+	}
+}
+
+// OpenCitations never has arxiv preprint data, so the seed-fetch path
+// must skip it and go straight to tertiary — saves ~1-2 s per sparse
+// arxiv seed by not paying for a guaranteed-empty round-trip.
+func TestHybridSkipsSecondaryForArxivPreprints(t *testing.T) {
+	primary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+		return &Paper{
+			PaperID:     "W7106158755",
+			Title:       "AsyncVLA",
+			ExternalIDs: ExternalIDs{"DOI": "10.48550/arxiv.2511.14148"},
+		}, nil
+	}}
+	secondary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+		t.Fatalf("secondary must not fire for an arxiv preprint seed")
+		return nil, nil
+	}}
+	var tertiaryID string
+	tertiary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+		tertiaryID = id
+		return &Paper{References: []Paper{{PaperID: "TREF1"}}}, nil
+	}}
+
+	h := &HybridClient{Primary: primary, Secondary: secondary, Tertiary: tertiary}
+	p, err := h.GetPaper(context.Background(), "W7106158755", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tertiaryID != "DOI:10.48550/arxiv.2511.14148" {
+		t.Errorf("tertiary lookup id: got %q, want DOI:10.48550/arxiv.2511.14148", tertiaryID)
+	}
+	if len(p.References) != 1 {
+		t.Errorf("want 1 ref from tertiary supplement, got %d", len(p.References))
 	}
 }
 
