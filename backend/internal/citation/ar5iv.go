@@ -58,7 +58,11 @@ func NewAr5ivClient(opts Ar5ivOptions) *Ar5ivClient {
 		opts.RPS = 3.0
 	}
 	if opts.Burst == 0 {
-		opts.Burst = 5
+		// Burst 10 lets the parallel supplement loop fan out its first
+		// wave immediately; subsequent calls drain at RPS. Cold builds
+		// rarely issue more than ~30 ar5iv requests, so the burst absorbs
+		// most of the initial spike without straining the labs service.
+		opts.Burst = 10
 	}
 	return &Ar5ivClient{
 		httpClient: opts.HTTPClient,

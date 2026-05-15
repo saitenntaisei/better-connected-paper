@@ -136,25 +136,32 @@ var minimalLinkFields = []string{
 	"citations.paperId",
 }
 
-// bridgeLinkFields is the refs-only fetch used for 2-hop bridge candidates.
-// Cites enrichment is deliberately skipped: most famous bridges have >100
-// citers, the OpenAlex client would then flag them CitationsUnknown, and
-// we'd have paid a per-paper fanout of cites requests for nothing. Refs are
-// returned inline in the /works response, so this batch stays ~O(|bridges|).
-// citationCount is required for coCite denominator; see minimalLinkFields.
+// bridgeLinkFields is the metadata fetch used for 2-hop bridge candidates.
+// Refs are deliberately omitted: bridges are ranked by 2-hop support (a
+// count derived from firstHop's refs, which we already have), and biblio
+// coupling between bridges and the rest of the graph stays at 0 — the
+// embedding-similarity layer already wires bridges in. Skipping refs
+// here skips the ar5iv + paginated /references supplement chain for the
+// entire bridges batch, the biggest single perf win on sparse-seed builds.
+// Cites enrichment is also deliberately skipped: most famous bridges
+// have >100 citers, the OpenAlex client would then flag them
+// CitationsUnknown, and we'd have paid a per-paper fanout of cites
+// requests for nothing.
 var bridgeLinkFields = []string{
 	"paperId",
 	"citationCount",
-	"references.paperId",
 }
 
 // fullNodeFields hydrates a selected node for the final response (title,
-// authors, abstract, etc.). We only pay this for at most MaxNodes papers.
+// authors, abstract, etc.). Refs/cites are NOT requested here — by this
+// point firstHopByID/bridgesByID already carry the supplemented refs
+// (Build merges them into the full slice after the fetch), so re-firing
+// the ar5iv + paginated chain for full-fetch would duplicate the work
+// the firstHop phase already paid for. We only pay this for at most
+// MaxNodes papers.
 var fullNodeFields = []string{
 	"paperId", "title", "abstract", "year", "venue", "authors",
 	"citationCount", "referenceCount", "externalIds", "url",
-	"references.paperId",
-	"citations.paperId",
 }
 
 // Build expands the graph around seedID. The expansion is staged (cheap
@@ -244,6 +251,27 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
 	canonicalizeSeedAlias(full, seedAlias, seed.PaperID)
+	// fullNodeFields omits refs/cites to skip the ar5iv + paginated
+	// supplement chain on the final fetch — firstHop and bridges already
+	// paid for that work, so copy their populated links into the full
+	// slice before persistence and edge construction so linkSource can
+	// pick them up via fullByID without re-fetching.
+	for i := range full {
+		p := &full[i]
+		if len(p.References) == 0 {
+			if earlier, ok := firstHopByID[p.PaperID]; ok && len(earlier.References) > 0 {
+				p.References = earlier.References
+			} else if earlier, ok := bridgesByID[p.PaperID]; ok && len(earlier.References) > 0 {
+				p.References = earlier.References
+			}
+		}
+		if len(p.Citations) == 0 && !p.CitationsUnknown {
+			if earlier, ok := firstHopByID[p.PaperID]; ok && len(earlier.Citations) > 0 {
+				p.Citations = earlier.Citations
+				p.CitationsUnknown = earlier.CitationsUnknown
+			}
+		}
+	}
 	fullByID := indexPapers(full)
 	b.persistFetched(ctx, seed, full)
 
