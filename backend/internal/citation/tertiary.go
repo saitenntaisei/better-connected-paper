@@ -182,8 +182,18 @@ func (r *ResolvingTertiary) GetPaper(ctx context.Context, id string, fields []st
 // citers differently, so the paginated tail reliably contains papers the
 // inline response dropped — most visibly the recent-preprint band that makes
 // or breaks the Prior Works cluster in our graph builds.
+//
+// Skipped in deferred-ar5iv mode: the paginated /citations endpoint is
+// 1 RPS S2 and costs ~5 s for a 500-extra fetch on a 1000+ cite seed
+// (Octo). The forced-sync background rerun picks them up before
+// StoreGraph writes the enriched payload, so the user sees a fast
+// initial response capped at the inline 1000 citers and a fully
+// supplemented cluster on the next request.
 func (r *ResolvingTertiary) supplementCiters(ctx context.Context, id string, p *Paper) {
 	if r.CiterSupplementLimit <= 0 || p == nil {
+		return
+	}
+	if perPaperSupplementSkipped(ctx) {
 		return
 	}
 	const inlineCap = 1000

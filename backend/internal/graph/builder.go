@@ -158,6 +158,19 @@ var minimalLinkFields = []string{
 	"references.paperId",
 }
 
+// firstHopFieldsLean is the deferred-mode-only variant of
+// minimalLinkFields that omits even the refs id list. With bridges
+// skipped on the FG path the refs would only be consumed by biblio
+// coupling — and the embedding-similarity layer already covers that
+// signal, so the supplementBatchRefs round-trip (S2 inline batch +
+// DOI resolver) is pure overhead on the hot path. The forced-sync
+// background rerun goes back to minimalLinkFields so the cache row
+// landed by StoreGraph is the full enriched build.
+var firstHopFieldsLean = []string{
+	"paperId",
+	"citationCount",
+}
+
 // bridgeLinkFields is the metadata fetch used for 2-hop bridge candidates.
 // Refs are deliberately omitted: bridges are ranked by 2-hop support (a
 // count derived from firstHop's refs, which we already have), and biblio
@@ -245,7 +258,19 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	if b.MaxFirstHop > 0 && len(firstHopIDs) > b.MaxFirstHop {
 		firstHopIDs = firstHopIDs[:b.MaxFirstHop]
 	}
-	firstHop, err := b.fetchWithCache(ctx, firstHopIDs, minimalLinkFields)
+	// In deferred-ar5iv FG we never need firstHop's refs: bridges (the
+	// only consumer of two-hop support) are skipped above, and biblio
+	// coupling for similarity edges is replaced by the specter embedding
+	// layer. Asking for "references.paperId" would still fire the entire
+	// supplementBatchRefs path inside HybridClient (S2 inline batch +
+	// translateRefsBatch + DOI resolver) for nothing — skip it on the
+	// hot path and let the forced-sync background rerun pick up the
+	// canonical refs into paper_links.
+	firstHopFields := minimalLinkFields
+	if deferAr5iv {
+		firstHopFields = firstHopFieldsLean
+	}
+	firstHop, err := b.fetchWithCache(ctx, firstHopIDs, firstHopFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetch first hop: %w", err)
 	}
