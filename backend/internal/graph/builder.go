@@ -133,6 +133,15 @@ type Builder struct {
 	// slower) — Vercel-style serverless deployments where a goroutine
 	// can't outlive the response should leave this off.
 	DeferAr5iv bool
+
+	// deferInFlight tracks which seedIDs already have a deferred-ar5iv
+	// goroutine running, so back-to-back FG requests for the same seed
+	// (e.g. user retry, browser pre-flight) don't each kick off a 3-min
+	// rebuild hitting S2/OpenAlex/ar5iv twice for the same data and
+	// racing on StoreGraph. Sync.Map keyed on seedID with struct{}{}
+	// value; spawnDeferredAr5iv claims via LoadOrStore and the goroutine
+	// clears on exit.
+	deferInFlight sync.Map
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -454,8 +463,20 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 // background populated paper_links, because the rebuild still had to
 // walk every fetch / rank / edge phase. Writing the enriched payload
 // here turns that refresh into a pure cache hit.
+//
+// Concurrent FG calls for the same seed are deduplicated via
+// deferInFlight: only the first claim spawns; later calls log and
+// return so we don't pay the rebuild twice (and don't race on the
+// StoreGraph write).
 func (b *Builder) spawnDeferredAr5iv(seedID string) {
+	if _, loaded := b.deferInFlight.LoadOrStore(seedID, struct{}{}); loaded {
+		if b.Logger != nil {
+			b.Logger.Info("deferred ar5iv backfill: already in flight; skipping", "seed", seedID)
+		}
+		return
+	}
 	go func() {
+		defer b.deferInFlight.Delete(seedID)
 		bgCtx, cancel := context.WithTimeout(citation.WithForceSyncAr5iv(context.Background()), 3*time.Minute)
 		defer cancel()
 		if b.Logger != nil {
