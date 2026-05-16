@@ -220,14 +220,30 @@ func (c *OpenAlexClient) ResolveByDOI(ctx context.Context, dois []string) ([]Pap
 	}
 	wg.Wait()
 
+	// Surface the real error: when one chunk fails it calls cancel(),
+	// which makes sibling in-flight goroutines see context.Canceled.
+	// Returning the first non-nil err in index order would surface that
+	// downstream context.Canceled instead of the upstream cause, so
+	// prefer any non-cancel error over context.Canceled / DeadlineExceeded.
 	out := make([]Paper, 0, len(dois))
+	var firstErr error
 	for _, r := range results {
 		if r.err != nil {
-			return nil, r.err
+			if firstErr == nil || (isCtxCancelErr(firstErr) && !isCtxCancelErr(r.err)) {
+				firstErr = r.err
+			}
+			continue
 		}
 		out = append(out, r.papers...)
 	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
 	return out, nil
+}
+
+func isCtxCancelErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // GetPaperBatch fans the ID list out over /works?filter=openalex:W1|W2|...
