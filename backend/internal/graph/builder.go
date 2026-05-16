@@ -933,6 +933,14 @@ func rankCandidates(
 ) []scoredCandidate {
 	seedRefs := seed.RefIDs()
 	seedCiters := seed.CitedByIDs()
+	// Normalized seed title is used to filter OpenAlex sibling Works that
+	// share the seed's identity (Octo's RSS conference DOI W4402353985 and
+	// its arxiv DOI W4398192846 are both indexed as separate Works; both
+	// appear in the candidate pool via direct refs/citers and score ~0.99
+	// against the seed, displacing genuine neighbors). Empty title leaves
+	// the filter inactive — older test fixtures without titles still rank
+	// unchanged.
+	seedTitleNorm := citation.NormalizeTitle(seed.Title)
 
 	// firstHopRefSets[P] is the set of ids P references. A subset of seedCiters
 	// overlaps firstHop (seeds we fetched via minimalLinkFields), so we get
@@ -959,11 +967,20 @@ func rankCandidates(
 		if _, already := scores[p.PaperID]; already {
 			return
 		}
+		// Reject seed-aliased Works whose normalized title matches the
+		// seed's. See seedTitleNorm comment above for the Octo regression.
+		if seedTitleNorm != "" && p.Title != "" && citation.NormalizeTitle(p.Title) == seedTitleNorm {
+			return
+		}
 		biblio := BibliographicCoupling(seedRefs, p.RefIDs())
 		coCite := CoCitationApprox(seedCiters, firstHopRefSets, p.PaperID, seed.CitationCount, p.CitationCount)
+		// rankingBonus combines a year-proximity lift (keeps the cluster
+		// in the seed's generation) with a saturating log-citation lift
+		// (rescues highly-cited refs that score low structurally). See
+		// rankingBonus for component weights and tuning rationale.
 		scores[p.PaperID] = scoredCandidate{
 			id:    p.PaperID,
-			score: ScoreCP(biblio, coCite),
+			score: ScoreCP(biblio, coCite) + rankingBonus(p.Year, seed.Year, p.CitationCount),
 			cc:    p.CitationCount,
 		}
 	}
