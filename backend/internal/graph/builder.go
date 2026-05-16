@@ -1004,13 +1004,20 @@ func rankCandidates(
 		}
 		biblio := BibliographicCoupling(seedRefs, p.RefIDs())
 		coCite := CoCitationApprox(seedCiters, firstHopRefSets, p.PaperID, seed.CitationCount, p.CitationCount)
+		structural := ScoreCP(biblio, coCite)
 		// rankingBonus combines a year-proximity lift (keeps the cluster
 		// in the seed's generation) with a saturating log-citation lift
-		// (rescues highly-cited refs that score low structurally). See
-		// rankingBonus for component weights and tuning rationale.
+		// (rescues highly-cited refs that score low structurally). Cap
+		// the lift at structuralBonusMultiplier × structural so candidates
+		// with essentially zero structural signal can't be propped up
+		// by bonuses alone — that's what surfaced bogus high-cc papers
+		// (MizAR / Aion Framework with OpenAlex-side cc inflation)
+		// in DROID's graph via wrong upstream paper_links edges.
+		// See rankingBonus for component weights.
+		score := structural + cappedRankingBonus(structural, p.Year, seed.Year, p.CitationCount)
 		scores[p.PaperID] = scoredCandidate{
 			id:    p.PaperID,
-			score: ScoreCP(biblio, coCite) + rankingBonus(p.Year, seed.Year, p.CitationCount),
+			score: score,
 			cc:    p.CitationCount,
 		}
 	}

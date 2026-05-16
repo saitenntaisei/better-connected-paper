@@ -107,6 +107,31 @@ func ScoreCP(biblio, coCite float64) float64 {
 	return (biblio + coCite) / 2
 }
 
+// cappedRankingBonus returns rankingBonus clamped to
+// structuralBonusMultiplier × structural, so a candidate with zero or
+// near-zero biblio+coCite score can't be propped up to top-MaxNodes
+// by bonus signals alone. Bogus paper_links edges from upstream data
+// (e.g. OpenAlex citation-count inflation on Mizar / Aion-class
+// works that wrongly appear as 2-hop bridges) trip this guard:
+// their structural score stays at the floor, so the bonus is
+// proportionally crushed and they drop out of the cut.
+//
+// structuralBonusMultiplier = 4 keeps the cap from constraining
+// genuine candidates: a struct≈0.04 direct ref like Diffusion Policy
+// against Octo allows up to 0.16 bonus, easily covering the 0.20
+// max from yearProximity + citationCount; a struct≈0.20 well-coupled
+// peer can soak the full bonus without being capped. Only candidates
+// with struct < ~0.05 see the cap bite.
+func cappedRankingBonus(structural float64, candYear, seedYear, candCC int) float64 {
+	const structuralBonusMultiplier = 4.0
+	raw := rankingBonus(candYear, seedYear, candCC)
+	cap := structural * structuralBonusMultiplier
+	if raw > cap {
+		return cap
+	}
+	return raw
+}
+
 // rankingBonus adds two orthogonal Connected-Papers-like signals on top
 // of the structural Salton score so the top-MaxNodes cut matches the
 // "few dozen most-related" cluster a human would expect.

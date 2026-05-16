@@ -142,3 +142,37 @@ func TestCitationCountBonusSaturates(t *testing.T) {
 		t.Errorf("cc=100 bonus must sit in (0, 0.08), got %v", got)
 	}
 }
+
+// cappedRankingBonus must crush the year + cc bonus when a candidate's
+// structural score is near zero — that's what surfaced bogus high-cc
+// 2-hop bridges (Mizar/Aion-class papers with OpenAlex-side citation
+// inflation) in DROID's graph via wrong upstream paper_links. With
+// the cap, a struct≈0 candidate inherits a cap≈0 bonus and falls out
+// of the top-MaxNodes cut. Genuine candidates with even modest
+// structural signal (struct≥0.05) keep the full bonus because the
+// 4× multiplier easily covers the 0.20 raw maximum.
+func TestCappedRankingBonusCrushesBonusOnLowStructural(t *testing.T) {
+	cases := []struct {
+		name               string
+		structural         float64
+		candYear, seedYear int
+		candCC             int
+		wantMaxBonus       float64
+	}{
+		// cap = structural × 4, so a struct=0 candidate gets bonus=0
+		// regardless of raw year/cc inputs.
+		{"zero structural", 0.0, 2024, 2024, 75670, 0.0},
+		// near-zero structural: cap = 0.02 << raw ≈ 0.20.
+		{"near-zero structural", 0.005, 2024, 2024, 75670, 0.02},
+		// modest structural: cap = 0.20 ≥ raw ≈ 0.17, no clamp.
+		{"modest structural", 0.05, 2024, 2024, 350, 0.20},
+		// strong structural: cap big, raw small (low cc), returned as-is.
+		{"strong structural", 0.30, 2024, 2024, 1, 0.13},
+	}
+	for _, c := range cases {
+		got := cappedRankingBonus(c.structural, c.candYear, c.seedYear, c.candCC)
+		if got > c.wantMaxBonus+1e-6 {
+			t.Errorf("%s: bonus %v exceeds cap %v", c.name, got, c.wantMaxBonus)
+		}
+	}
+}
