@@ -162,8 +162,18 @@ var seedFields = []string{
 // cites), and asking OpenAlex for citations.paperId triggers a per-paper
 // /works?filter=cites: enrichment call that costs ~3 s across a 30-paper
 // first hop for no scoring or edge value.
+//
+// `title` and `year` are requested even though the OpenAlex client
+// always returns them: rankCandidates reads p.Title for seed-alias
+// dedupe and p.Year for the year-proximity bonus, so we ask explicitly
+// to keep behaviour stable across providers — Semantic Scholar honours
+// the field list and silently drops fields the caller didn't request,
+// which would zero out both signals on a hypothetical S2-primary
+// configuration.
 var minimalLinkFields = []string{
 	"paperId",
+	"title",
+	"year",
 	"citationCount",
 	"references.paperId",
 }
@@ -176,8 +186,12 @@ var minimalLinkFields = []string{
 // DOI resolver) is pure overhead on the hot path. The forced-sync
 // background rerun goes back to minimalLinkFields so the cache row
 // landed by StoreGraph is the full enriched build.
+// Title/year stay in the list for the same dedupe-and-year-bonus
+// reason as minimalLinkFields above.
 var firstHopFieldsLean = []string{
 	"paperId",
+	"title",
+	"year",
 	"citationCount",
 }
 
@@ -191,9 +205,12 @@ var firstHopFieldsLean = []string{
 // Cites enrichment is also deliberately skipped: most famous bridges
 // have >100 citers, the OpenAlex client would then flag them
 // CitationsUnknown, and we'd have paid a per-paper fanout of cites
-// requests for nothing.
+// requests for nothing. Title/year stay in the list for rankCandidates'
+// dedupe + year bonus.
 var bridgeLinkFields = []string{
 	"paperId",
+	"title",
+	"year",
 	"citationCount",
 }
 
@@ -411,7 +428,20 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 			}
 		}
 		n := ToNode(p)
-		n.Similarity = s.score
+		// s.score = ScoreCP(biblio, coCite) + rankingBonus, which can
+		// climb to 1.20 once a high-overlap candidate (ScoreCP ≈ 1.0)
+		// also collects the full 0.20 year + cc bonus. Node.Similarity
+		// is documented as [0, 1] in types.go and frontend consumers
+		// can normalise on that range, so clamp here while preserving
+		// the unbounded value inside scoredCandidate for ranking
+		// stability.
+		sim := s.score
+		if sim > 1.0 {
+			sim = 1.0
+		} else if sim < 0 {
+			sim = 0
+		}
+		n.Similarity = sim
 		nodes = append(nodes, n)
 	}
 
@@ -933,6 +963,14 @@ func rankCandidates(
 ) []scoredCandidate {
 	seedRefs := seed.RefIDs()
 	seedCiters := seed.CitedByIDs()
+	// Normalized seed title is used to filter OpenAlex sibling Works that
+	// share the seed's identity (Octo's RSS conference DOI W4402353985 and
+	// its arxiv DOI W4398192846 are both indexed as separate Works; both
+	// appear in the candidate pool via direct refs/citers and score ~0.99
+	// against the seed, displacing genuine neighbors). Empty title leaves
+	// the filter inactive — older test fixtures without titles still rank
+	// unchanged.
+	seedTitleNorm := citation.NormalizeTitle(seed.Title)
 
 	// firstHopRefSets[P] is the set of ids P references. A subset of seedCiters
 	// overlaps firstHop (seeds we fetched via minimalLinkFields), so we get
@@ -959,11 +997,27 @@ func rankCandidates(
 		if _, already := scores[p.PaperID]; already {
 			return
 		}
+		// Reject seed-aliased Works whose normalized title matches the
+		// seed's. See seedTitleNorm comment above for the Octo regression.
+		if seedTitleNorm != "" && p.Title != "" && citation.NormalizeTitle(p.Title) == seedTitleNorm {
+			return
+		}
 		biblio := BibliographicCoupling(seedRefs, p.RefIDs())
 		coCite := CoCitationApprox(seedCiters, firstHopRefSets, p.PaperID, seed.CitationCount, p.CitationCount)
+		structural := ScoreCP(biblio, coCite)
+		// rankingBonus combines a year-proximity lift (keeps the cluster
+		// in the seed's generation) with a saturating log-citation lift
+		// (rescues highly-cited refs that score low structurally). Cap
+		// the lift at structuralBonusMultiplier × structural so candidates
+		// with essentially zero structural signal can't be propped up
+		// by bonuses alone — that's what surfaced bogus high-cc papers
+		// (MizAR / Aion Framework with OpenAlex-side cc inflation)
+		// in DROID's graph via wrong upstream paper_links edges.
+		// See rankingBonus for component weights.
+		score := structural + cappedRankingBonus(structural, p.Year, seed.Year, p.CitationCount)
 		scores[p.PaperID] = scoredCandidate{
 			id:    p.PaperID,
-			score: ScoreCP(biblio, coCite),
+			score: score,
 			cc:    p.CitationCount,
 		}
 	}
