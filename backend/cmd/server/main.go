@@ -80,8 +80,11 @@ func main() {
 		// goroutine after the sync build to populate ar5iv-sourced refs so
 		// the next request for the same seed serves the enriched graph.
 		// Vercel api/server.go leaves this off — serverless functions
-		// can't keep a goroutine alive past the response.
-		DeferAr5iv: !strings.EqualFold(os.Getenv("DEFER_AR5IV"), "false"),
+		// can't keep a goroutine alive past the response. Cache must be
+		// available too: without a place to StoreGraph the enriched
+		// payload, the background work would be discarded and the next
+		// request would rebuild from scratch.
+		DeferAr5iv: cache != nil && !strings.EqualFold(os.Getenv("DEFER_AR5IV"), "false"),
 	}
 	deps := api.Deps{S2: paperClient, DB: db, Builder: builder}
 

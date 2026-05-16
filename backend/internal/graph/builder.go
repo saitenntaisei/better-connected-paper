@@ -403,10 +403,11 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	}
 
 	return &Response{
-		Seed:    seedNode,
-		Nodes:   nodes,
-		Edges:   edges,
-		BuiltAt: now().UTC(),
+		Seed:        seedNode,
+		Nodes:       nodes,
+		Edges:       edges,
+		BuiltAt:     now().UTC(),
+		Preliminary: deferAr5iv,
 	}, nil
 }
 

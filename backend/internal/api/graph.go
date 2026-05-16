@@ -75,8 +75,17 @@ func (d Deps) BuildGraph(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "marshal: "+err.Error())
 		return
 	}
-	if err := d.DB.PutGraph(r.Context(), seed, payload, store.DefaultGraphTTL); err != nil {
-		w.Header().Set("X-Cache-Write-Error", err.Error())
+	if !resp.Preliminary {
+		// Skip the cache write for deferred-ar5iv preliminary responses:
+		// the spawned background goroutine will StoreGraph the enriched
+		// payload directly, so a sparse FG payload should never be the
+		// last writer. If the background fails or the process dies
+		// before it finishes, the cache stays empty and the next request
+		// rebuilds — much better UX than serving a permanently-sparse
+		// graph for the next 30 days.
+		if err := d.DB.PutGraph(r.Context(), seed, payload, store.DefaultGraphTTL); err != nil {
+			w.Header().Set("X-Cache-Write-Error", err.Error())
+		}
 	}
 
 	w.Header().Set("X-Cache", "miss")
