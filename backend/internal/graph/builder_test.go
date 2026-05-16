@@ -226,6 +226,8 @@ type fieldAwareStubS2 struct {
 
 func (s *fieldAwareStubS2) trim(ids []string, fields []string) []citation.Paper {
 	wantCC := slices.Contains(fields, "citationCount")
+	wantTitle := slices.Contains(fields, "title")
+	wantYear := slices.Contains(fields, "year")
 	out := make([]citation.Paper, 0, len(ids))
 	for _, id := range ids {
 		p, ok := s.papers[id]
@@ -234,6 +236,12 @@ func (s *fieldAwareStubS2) trim(ids []string, fields []string) []citation.Paper 
 		}
 		if !wantCC {
 			p.CitationCount = 0
+		}
+		if !wantTitle {
+			p.Title = ""
+		}
+		if !wantYear {
+			p.Year = 0
 		}
 		out = append(out, p)
 	}
@@ -268,6 +276,68 @@ func TestScoringFieldListsIncludeCitationCount(t *testing.T) {
 	} {
 		if !slices.Contains(tc.fields, "citationCount") {
 			t.Errorf("%s missing %q — CoCitationApprox needs it as the Salton denominator for candidate citers", tc.name, "citationCount")
+		}
+	}
+}
+
+// rankCandidates reads p.Title (seed-alias dedupe) and p.Year (year-proximity
+// bonus). Semantic Scholar honours the caller's field list, so dropping
+// either from the ranking-time fetches silently disables those signals on
+// any S2-backed configuration. Guards against a future edit that trims
+// fields without realising the ranker depends on title/year too.
+func TestScoringFieldListsIncludeTitleAndYear(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields []string
+	}{
+		{"minimalLinkFields", minimalLinkFields},
+		{"firstHopFieldsLean", firstHopFieldsLean},
+		{"bridgeLinkFields", bridgeLinkFields},
+	} {
+		if !slices.Contains(tc.fields, "title") {
+			t.Errorf("%s missing %q — rankCandidates uses p.Title for seed-alias dedupe", tc.name, "title")
+		}
+		if !slices.Contains(tc.fields, "year") {
+			t.Errorf("%s missing %q — rankCandidates uses p.Year for year-proximity bonus", tc.name, "year")
+		}
+	}
+}
+
+// Regression: seed-alias dedupe must survive a provider that gates fields
+// on the requested list. Octo's RSS DOI sibling (W4398192846 in production)
+// is a self-titled OpenAlex variant; without title in the ranking fetch
+// fields it sneaks back in with a near-1.0 self-similarity score and
+// pollutes the top-MaxNodes cut. A field-aware S2 stub drives the build
+// with the same minimalLinkFields the production code uses and asserts
+// the dup is rejected.
+func TestBuildDedupesSeedAliasAcrossFieldGating(t *testing.T) {
+	withMeta := func(p citation.Paper, cc int, title string, year int) citation.Paper {
+		p.CitationCount = cc
+		p.Title = title
+		p.Year = year
+		return p
+	}
+	// Seed S cites its own self-title sibling D plus an unrelated paper U.
+	// D shares all of S's refs (perfect 1.0 biblio), so it would dominate
+	// the ranking if the dedupe filter doesn't have its title.
+	seed := withMeta(paper("S", []string{"R1", "R2", "R3"}, nil), 5, "A Generalist Paper", 2024)
+	dup := withMeta(paper("D", []string{"R1", "R2", "R3"}, nil), 1, "A Generalist Paper", 2024)
+	unrelated := withMeta(paper("U", []string{"X1", "X2"}, nil), 10, "Unrelated Work", 2023)
+	s2 := &fieldAwareStubS2{papers: map[string]citation.Paper{
+		"S": seed, "D": dup, "U": unrelated,
+		"R1": paper("R1", nil, nil), "R2": paper("R2", nil, nil), "R3": paper("R3", nil, nil),
+	}}
+	// Add D and U as seed's cite-targets so they enter the candidate pool.
+	s2.papers["S"] = withMeta(paper("S", []string{"R1", "R2", "R3"}, []string{"D", "U"}), 5, "A Generalist Paper", 2024)
+	b := &Builder{S2: s2, MaxNodes: 10}
+
+	resp, err := b.Build(context.Background(), "S")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for _, n := range resp.Nodes {
+		if n.ID == "D" {
+			t.Fatalf("self-titled sibling D survived ranking — title filter must reach rankCandidates (got similarity %v)", n.Similarity)
 		}
 	}
 }
