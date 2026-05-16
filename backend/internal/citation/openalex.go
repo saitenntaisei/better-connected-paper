@@ -161,8 +161,8 @@ func (c *OpenAlexClient) ResolveByDOI(ctx context.Context, dois []string) ([]Pap
 		return nil, nil
 	}
 	const (
-		chunkSize          = 50
-		resolveDOIWorkers  = 5
+		chunkSize         = 50
+		resolveDOIWorkers = 5
 	)
 	chunks := make([][]string, 0, (len(dois)+chunkSize-1)/chunkSize)
 	for start := 0; start < len(dois); start += chunkSize {
