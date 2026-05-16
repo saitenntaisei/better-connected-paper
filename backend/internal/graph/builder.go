@@ -2,12 +2,14 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/saitenntaisei/better-connected-paper/internal/citation"
@@ -31,6 +33,15 @@ type Cache interface {
 	GetPapersWithLinks(ctx context.Context, ids []string) ([]citation.Paper, error)
 	UpsertPapers(ctx context.Context, papers []citation.Paper) error
 	ReplacePaperLinks(ctx context.Context, paperID string, refs, cites []string) error
+	// InvalidateGraph drops the cached JSON payload for a seed.
+	InvalidateGraph(ctx context.Context, seedID string) error
+	// StoreGraph replaces the cached JSON payload for a seed. Used by the
+	// deferred-ar5iv background goroutine: after rerunning Build with
+	// full supplements, the enriched graph is written here directly so
+	// the next /api/graph/build request returns it from the cache
+	// instead of rebuilding (turns refresh into an instant cache hit
+	// rather than the ~10 s rebuild it would otherwise take).
+	StoreGraph(ctx context.Context, seedID string, payload []byte) error
 }
 
 // Builder constructs the directed graph around a seed paper.
@@ -112,6 +123,25 @@ type Builder struct {
 	// function cap once /paper, /recs, and /embedding calls are added in.
 	// Set negative to disable the cap (unbounded).
 	RefsBackfillBudget int
+
+	// DeferAr5iv runs the initial Build with ar5iv suppressed (the user
+	// gets the recs + embedding-similarity layer immediately, in ≈7 s
+	// instead of ≈15 s), then spawns a background goroutine that reruns
+	// the build with ar5iv enabled so the next /api/graph/build request
+	// for the same seed serves the enriched cite-arrow graph from the
+	// paper_links cache. Set false to keep ar5iv inline (correct, just
+	// slower) — Vercel-style serverless deployments where a goroutine
+	// can't outlive the response should leave this off.
+	DeferAr5iv bool
+
+	// deferInFlight tracks which seedIDs already have a deferred-ar5iv
+	// goroutine running, so back-to-back FG requests for the same seed
+	// (e.g. user retry, browser pre-flight) don't each kick off a 3-min
+	// rebuild hitting S2/OpenAlex/ar5iv twice for the same data and
+	// racing on StoreGraph. Sync.Map keyed on seedID with struct{}{}
+	// value; spawnDeferredAr5iv claims via LoadOrStore and the goroutine
+	// clears on exit.
+	deferInFlight sync.Map
 }
 
 // seedFields are requested for the initial /paper/{id} call: full metadata
@@ -125,36 +155,58 @@ var seedFields = []string{
 }
 
 // minimalLinkFields is the cheap fetch used to explore the 1-hop cloud:
-// paper id plus the id lists we need for scoring. No title/abstract/etc.,
-// so the response size stays linear in |refs|+|cites| rather than quadratic.
-// citationCount is required by CoCitationApprox as the Salton denominator
-// scale for each candidate; without it the coCite term collapses to 0.
+// paper id, citationCount (the Salton denominator scale for the coCite
+// term — without it the coCite score collapses to 0), and the refs id
+// list. Cites are NOT requested here: rank, twoHopSupport, and the
+// final cite-edge construction all read from firstHop's *refs* (not
+// cites), and asking OpenAlex for citations.paperId triggers a per-paper
+// /works?filter=cites: enrichment call that costs ~3 s across a 30-paper
+// first hop for no scoring or edge value.
 var minimalLinkFields = []string{
 	"paperId",
 	"citationCount",
 	"references.paperId",
-	"citations.paperId",
 }
 
-// bridgeLinkFields is the refs-only fetch used for 2-hop bridge candidates.
-// Cites enrichment is deliberately skipped: most famous bridges have >100
-// citers, the OpenAlex client would then flag them CitationsUnknown, and
-// we'd have paid a per-paper fanout of cites requests for nothing. Refs are
-// returned inline in the /works response, so this batch stays ~O(|bridges|).
-// citationCount is required for coCite denominator; see minimalLinkFields.
+// firstHopFieldsLean is the deferred-mode-only variant of
+// minimalLinkFields that omits even the refs id list. With bridges
+// skipped on the FG path the refs would only be consumed by biblio
+// coupling — and the embedding-similarity layer already covers that
+// signal, so the supplementBatchRefs round-trip (S2 inline batch +
+// DOI resolver) is pure overhead on the hot path. The forced-sync
+// background rerun goes back to minimalLinkFields so the cache row
+// landed by StoreGraph is the full enriched build.
+var firstHopFieldsLean = []string{
+	"paperId",
+	"citationCount",
+}
+
+// bridgeLinkFields is the metadata fetch used for 2-hop bridge candidates.
+// Refs are deliberately omitted: bridges are ranked by 2-hop support (a
+// count derived from firstHop's refs, which we already have), and biblio
+// coupling between bridges and the rest of the graph stays at 0 — the
+// embedding-similarity layer already wires bridges in. Skipping refs
+// here skips the ar5iv + paginated /references supplement chain for the
+// entire bridges batch, the biggest single perf win on sparse-seed builds.
+// Cites enrichment is also deliberately skipped: most famous bridges
+// have >100 citers, the OpenAlex client would then flag them
+// CitationsUnknown, and we'd have paid a per-paper fanout of cites
+// requests for nothing.
 var bridgeLinkFields = []string{
 	"paperId",
 	"citationCount",
-	"references.paperId",
 }
 
 // fullNodeFields hydrates a selected node for the final response (title,
-// authors, abstract, etc.). We only pay this for at most MaxNodes papers.
+// authors, abstract, etc.). Refs/cites are NOT requested here — by this
+// point firstHopByID/bridgesByID already carry the supplemented refs
+// (Build merges them into the full slice after the fetch), so re-firing
+// the ar5iv + paginated chain for full-fetch would duplicate the work
+// the firstHop phase already paid for. We only pay this for at most
+// MaxNodes papers.
 var fullNodeFields = []string{
 	"paperId", "title", "abstract", "year", "venue", "authors",
 	"citationCount", "referenceCount", "externalIds", "url",
-	"references.paperId",
-	"citations.paperId",
 }
 
 // Build expands the graph around seedID. The expansion is staged (cheap
@@ -172,6 +224,16 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	// chunked across multiple GetPaperBatch calls can't stack 60 s of
 	// 1-RPS calls and blow the Vercel function cap.
 	ctx = citation.WithRefsBackfillBudget(ctx, b.refsBackfillBudget())
+
+	// Deferred-ar5iv mode: drop ar5iv from the sync path, then spawn a
+	// background re-build (with ar5iv forced on) and invalidate the
+	// cached graphs payload so the next request rebuilds against the
+	// freshly populated paper_links rows. The background goroutine
+	// itself bypasses defer via IsForceSyncAr5iv to avoid recursion.
+	deferAr5iv := b.DeferAr5iv && !citation.IsForceSyncAr5iv(ctx)
+	if deferAr5iv {
+		ctx = citation.WithSkipAr5iv(ctx, true)
+	}
 	now := time.Now
 	if b.Now != nil {
 		now = b.Now
@@ -206,7 +268,19 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	if b.MaxFirstHop > 0 && len(firstHopIDs) > b.MaxFirstHop {
 		firstHopIDs = firstHopIDs[:b.MaxFirstHop]
 	}
-	firstHop, err := b.fetchWithCache(ctx, firstHopIDs, minimalLinkFields)
+	// In deferred-ar5iv FG we never need firstHop's refs: bridges (the
+	// only consumer of two-hop support) are skipped above, and biblio
+	// coupling for similarity edges is replaced by the specter embedding
+	// layer. Asking for "references.paperId" would still fire the entire
+	// supplementBatchRefs path inside HybridClient (S2 inline batch +
+	// translateRefsBatch + DOI resolver) for nothing — skip it on the
+	// hot path and let the forced-sync background rerun pick up the
+	// canonical refs into paper_links.
+	firstHopFields := minimalLinkFields
+	if deferAr5iv {
+		firstHopFields = firstHopFieldsLean
+	}
+	firstHop, err := b.fetchWithCache(ctx, firstHopIDs, firstHopFields)
 	if err != nil {
 		return nil, fmt.Errorf("fetch first hop: %w", err)
 	}
@@ -217,15 +291,26 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 
 	// Bridge candidates: 2-hop papers with enough first-hop support to be
 	// worth hydrating. Capped to avoid a blow-out for high-degree seeds.
-	bridgeIDs := selectBridgeIDs(twoHopSupport, b.TwoHopSupport, b.MaxBridgeCandidates)
-	if seedAlias != "" {
-		bridgeIDs = filterOut(bridgeIDs, seedAlias)
+	// In deferred-ar5iv mode the initial response skips bridges entirely
+	// — recs + seed-cites already provide ~30 candidates, the embedding
+	// layer wires similarity edges between them, and an extra
+	// MaxBridgeCandidates batch fetch on the hot path adds ~3 s for
+	// nodes that mostly fall outside the top-MaxNodes cut anyway. The
+	// forced-sync background rerun (citation.IsForceSyncAr5iv) restores
+	// bridges so the enriched cached graph includes them on refresh.
+	var bridges []citation.Paper
+	if !deferAr5iv {
+		bridgeIDs := selectBridgeIDs(twoHopSupport, b.TwoHopSupport, b.MaxBridgeCandidates)
+		if seedAlias != "" {
+			bridgeIDs = filterOut(bridgeIDs, seedAlias)
+		}
+		var bErr error
+		bridges, bErr = b.fetchWithCache(ctx, bridgeIDs, bridgeLinkFields)
+		if bErr != nil {
+			return nil, fmt.Errorf("fetch two-hop bridges: %w", bErr)
+		}
+		canonicalizeSeedAlias(bridges, seedAlias, seed.PaperID)
 	}
-	bridges, err := b.fetchWithCache(ctx, bridgeIDs, bridgeLinkFields)
-	if err != nil {
-		return nil, fmt.Errorf("fetch two-hop bridges: %w", err)
-	}
-	canonicalizeSeedAlias(bridges, seedAlias, seed.PaperID)
 	bridgesByID := indexPapers(bridges)
 
 	scored := rankCandidates(seed, firstHop, bridges)
@@ -239,13 +324,72 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		selectedIDs = append(selectedIDs, s.id)
 	}
 
+	// embedder only reads externalIds, which OpenAlex always populates
+	// on every fetch (the client's hard-coded `select` includes `ids`),
+	// so the seed + firstHopByID / bridgesByID maps already carry
+	// everything the SPECTER batch needs. Kick the S2 round-trip off
+	// here so its 3-5 s rate-limited wall time overlaps the parallel
+	// OpenAlex full-fetch instead of stacking sequentially after it.
+	// linkSource (the post-full-fetch source-of-truth) is what the
+	// in-memory citation/biblio edge passes still read; only the
+	// embedder gets this preliminary view.
+	embedderLinks := make(map[string]citation.Paper, len(selectedIDs))
+	embedderLinks[seed.PaperID] = *seed
+	for _, id := range selectedIDs[1:] {
+		if p, ok := firstHopByID[id]; ok {
+			embedderLinks[id] = p
+		} else if p, ok := bridgesByID[id]; ok {
+			embedderLinks[id] = p
+		}
+	}
+	var (
+		embedderWG    sync.WaitGroup
+		embedderEdges []Edge
+	)
+	embedderWG.Add(1)
+	go func() {
+		defer embedderWG.Done()
+		embedderEdges = b.embeddingSimilarityEdges(ctx, selectedIDs, embedderLinks)
+	}()
+
 	full, err := b.fetchWithCache(ctx, selectedIDs[1:], fullNodeFields)
 	if err != nil {
+		embedderWG.Wait()
 		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
 	canonicalizeSeedAlias(full, seedAlias, seed.PaperID)
+	// fullNodeFields omits refs/cites to skip the ar5iv + paginated
+	// supplement chain on the final fetch — firstHop and bridges already
+	// paid for that work, so copy their populated links into the full
+	// slice before persistence and edge construction so linkSource can
+	// pick them up via fullByID without re-fetching.
+	for i := range full {
+		p := &full[i]
+		if len(p.References) == 0 {
+			if earlier, ok := firstHopByID[p.PaperID]; ok && len(earlier.References) > 0 {
+				p.References = earlier.References
+			} else if earlier, ok := bridgesByID[p.PaperID]; ok && len(earlier.References) > 0 {
+				p.References = earlier.References
+			}
+		}
+		if len(p.Citations) == 0 && !p.CitationsUnknown {
+			if earlier, ok := firstHopByID[p.PaperID]; ok && len(earlier.Citations) > 0 {
+				p.Citations = earlier.Citations
+				p.CitationsUnknown = earlier.CitationsUnknown
+			}
+		}
+	}
 	fullByID := indexPapers(full)
-	b.persistFetched(ctx, seed, full)
+	// Skip persistence in deferred-ar5iv FG: this run's papers carry
+	// sparse refs (per-paper supplements were intentionally bypassed),
+	// and persisting them would let the background rerun's
+	// fetchWithCache treat the half-populated rows as cache hits and
+	// shadow the ar5iv work the BG specifically came back to do. The
+	// forced-sync BG path re-persists with full supplements, so the
+	// cache ends up with the enriched state on refresh.
+	if !deferAr5iv {
+		b.persistFetched(ctx, seed, full)
+	}
 
 	nodes := make([]Node, 0, len(scored)+1)
 	seedNode := ToNode(*seed)
@@ -288,17 +432,79 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	selectedSet := sliceSet(selectedIDs)
 	edges := buildCiteEdges(selectedIDs, selectedSet, linkSource)
 	edges = append(edges, buildSimilarityEdges(selectedIDs, linkSource, b.SimilarityEdgeThreshold)...)
-	edges = append(edges, b.embeddingSimilarityEdges(ctx, selectedIDs, linkSource)...)
+	// Join the embedder goroutine kicked off before fetchWithCache. Its
+	// edges read externalIds (stable across firstHop/full fetches), so
+	// the parallel result is identical to what a serial call after the
+	// full fetch would have produced.
+	embedderWG.Wait()
+	edges = append(edges, embedderEdges...)
 	edges = dedupeEdges(edges)
 
 	nodes, edges = pruneOrphanNodes(seedNode.ID, nodes, edges)
 
+	if deferAr5iv {
+		b.spawnDeferredAr5iv(seedID)
+	}
+
 	return &Response{
-		Seed:    seedNode,
-		Nodes:   nodes,
-		Edges:   edges,
-		BuiltAt: now().UTC(),
+		Seed:        seedNode,
+		Nodes:       nodes,
+		Edges:       edges,
+		BuiltAt:     now().UTC(),
+		Preliminary: deferAr5iv,
 	}, nil
+}
+
+// spawnDeferredAr5iv re-runs Build with ar5iv forced on, in a goroutine
+// rooted at a fresh context so it outlives the original request. The
+// enriched Response is then written back to the graphs cache so the
+// next /api/graph/build request returns it from the cache as an
+// instant hit — refresh used to pay a ~10 s rebuild even after the
+// background populated paper_links, because the rebuild still had to
+// walk every fetch / rank / edge phase. Writing the enriched payload
+// here turns that refresh into a pure cache hit.
+//
+// Concurrent FG calls for the same seed are deduplicated via
+// deferInFlight: only the first claim spawns; later calls log and
+// return so we don't pay the rebuild twice (and don't race on the
+// StoreGraph write).
+func (b *Builder) spawnDeferredAr5iv(seedID string) {
+	if _, loaded := b.deferInFlight.LoadOrStore(seedID, struct{}{}); loaded {
+		if b.Logger != nil {
+			b.Logger.Info("deferred ar5iv backfill: already in flight; skipping", "seed", seedID)
+		}
+		return
+	}
+	go func() {
+		defer b.deferInFlight.Delete(seedID)
+		bgCtx, cancel := context.WithTimeout(citation.WithForceSyncAr5iv(context.Background()), 3*time.Minute)
+		defer cancel()
+		if b.Logger != nil {
+			b.Logger.Info("deferred ar5iv backfill: starting", "seed", seedID)
+		}
+		resp, err := b.Build(bgCtx, seedID)
+		if err != nil {
+			if b.Logger != nil {
+				b.Logger.Warn("deferred ar5iv backfill: build failed", "seed", seedID, "err", err)
+			}
+			return
+		}
+		if b.Cache != nil && resp != nil {
+			payload, mErr := json.Marshal(resp)
+			if mErr != nil {
+				if b.Logger != nil {
+					b.Logger.Warn("deferred ar5iv backfill: marshal failed", "seed", seedID, "err", mErr)
+				}
+				return
+			}
+			if sErr := b.Cache.StoreGraph(bgCtx, seedID, payload); sErr != nil && b.Logger != nil {
+				b.Logger.Warn("deferred ar5iv backfill: store graph failed", "seed", seedID, "err", sErr)
+			}
+		}
+		if b.Logger != nil {
+			b.Logger.Info("deferred ar5iv backfill: completed", "seed", seedID)
+		}
+	}()
 }
 
 // pruneOrphanNodes drops non-seed nodes that participate in zero edges. Such

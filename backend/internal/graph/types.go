@@ -48,6 +48,15 @@ type Response struct {
 	Nodes   []Node    `json:"nodes"`
 	Edges   []Edge    `json:"edges"`
 	BuiltAt time.Time `json:"builtAt"`
+	// Preliminary marks a deferred-ar5iv fast response: the build
+	// intentionally skipped bridges, link-supplements, and citer
+	// supplements to land under 10 s, and a background goroutine is
+	// re-running the full chain to replace this payload in the cache.
+	// The HTTP handler skips its own graph-cache write when set so a
+	// background failure can't leave the sparse payload permanently
+	// cached; the frontend can also use this to display an
+	// "enriching" indicator and poll for the enriched payload.
+	Preliminary bool `json:"preliminary,omitempty"`
 }
 
 // ToNode lifts a citation.Paper into a graph Node. IsSeed/Similarity are

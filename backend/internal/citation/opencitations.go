@@ -67,7 +67,12 @@ func NewOpenCitations(opts OpenCitationsOptions) *OpenCitationsClient {
 		opts.BaseURL = openCitationsBaseURL
 	}
 	if opts.HTTPClient == nil {
-		opts.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+		// 10 s per request: OpenCitations occasionally hangs for the full
+		// 30 s on cold high-citation DOIs (e.g. AlphaFold, 10.1038/*),
+		// and with retries the supplement chain was burning ~2 min of
+		// foreground budget on a single seed lookup. Cap each attempt at
+		// 10 s so even a worst-case 2-attempt retry stays bounded.
+		opts.HTTPClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	if opts.RPS == 0 {
 		opts.RPS = 5
@@ -75,9 +80,11 @@ func NewOpenCitations(opts OpenCitationsOptions) *OpenCitationsClient {
 	if opts.Burst == 0 {
 		opts.Burst = 2
 	}
-	if opts.MaxRetries == 0 {
-		opts.MaxRetries = 3
-	}
+	// Zero default = single attempt, no retries. Anything OpenCitations
+	// doesn't deliver in one 10 s shot is something the tertiary (S2)
+	// will resolve in a fraction of that — paying 2× the wall-clock for
+	// the same DOI hang is exactly the AlphaFold/Nature failure mode we
+	// hit. Callers can still override via OpenCitationsOptions.MaxRetries.
 	return &OpenCitationsClient{
 		httpClient: opts.HTTPClient,
 		baseURL:    strings.TrimRight(opts.BaseURL, "/"),

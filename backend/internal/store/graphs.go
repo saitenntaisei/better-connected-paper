@@ -54,6 +54,19 @@ func (db *DB) PutGraph(ctx context.Context, seedID string, payload json.RawMessa
 
 // InvalidateGraph removes a cached graph.
 func (db *DB) InvalidateGraph(ctx context.Context, seedID string) error {
+	if db == nil || db.Pool == nil {
+		return nil
+	}
 	_, err := db.Pool.Exec(ctx, "DELETE FROM graphs WHERE seed_id = $1", seedID)
 	return err
+}
+
+// StoreGraph is the graph.Cache-shaped wrapper around PutGraph: takes a
+// pre-serialised payload and applies DefaultGraphTTL internally so the
+// graph package doesn't have to import this one just to learn the TTL.
+// Used by the deferred-ar5iv background goroutine to replace the
+// initial sparse response with the enriched build so the next request
+// serves the full graph from the cache instead of rebuilding.
+func (db *DB) StoreGraph(ctx context.Context, seedID string, payload []byte) error {
+	return db.PutGraph(ctx, seedID, json.RawMessage(payload), DefaultGraphTTL)
 }

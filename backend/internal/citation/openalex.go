@@ -150,39 +150,100 @@ func (c *OpenAlexClient) GetPaper(ctx context.Context, id string, fields []strin
 // a missing paper just means one fewer edge in the final graph.
 // The returned Paper carries ExternalIDs["DOI"] so batch callers can
 // associate each resolved W-ID back to the input DOI that produced it.
+//
+// Chunks fire concurrently behind a semaphore (resolveDOIWorkers) so a
+// high-citation seed (1000+ DOIs, 20+ chunks) finishes in ~RPS-bound
+// wall time instead of serialized HTTP roundtrips. The rate limiter
+// inside `c.get` remains the actual throughput ceiling; the semaphore
+// just caps in-flight sockets so we don't open a connection per chunk.
 func (c *OpenAlexClient) ResolveByDOI(ctx context.Context, dois []string) ([]Paper, error) {
 	if len(dois) == 0 {
 		return nil, nil
 	}
-	const chunkSize = 50
-	out := make([]Paper, 0, len(dois))
+	const (
+		chunkSize         = 50
+		resolveDOIWorkers = 5
+	)
+	chunks := make([][]string, 0, (len(dois)+chunkSize-1)/chunkSize)
 	for start := 0; start < len(dois); start += chunkSize {
 		end := min(start+chunkSize, len(dois))
-		chunk := dois[start:end]
-		filter := "doi:" + strings.Join(chunk, "|")
-		q := url.Values{}
-		q.Set("filter", filter)
-		q.Set("per-page", strconv.Itoa(len(chunk)))
-		q.Set("select", "id,ids")
+		chunks = append(chunks, dois[start:end])
+	}
 
-		var raw openAlexList
-		if err := c.get(ctx, "/works?"+q.Encode(), &raw); err != nil {
-			return nil, err
+	type chunkResult struct {
+		papers []Paper
+		err    error
+	}
+	results := make([]chunkResult, len(chunks))
+	sem := make(chan struct{}, resolveDOIWorkers)
+	var wg sync.WaitGroup
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for i, chunk := range chunks {
+		select {
+		case <-cctx.Done():
+			results[i].err = cctx.Err()
+			continue
+		case sem <- struct{}{}:
 		}
-		for _, w := range raw.Results {
-			pid := stripOpenAlexPrefix(w.ID)
-			if pid == "" {
-				continue
+		wg.Add(1)
+		go func(i int, chunk []string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			filter := "doi:" + strings.Join(chunk, "|")
+			q := url.Values{}
+			q.Set("filter", filter)
+			q.Set("per-page", strconv.Itoa(len(chunk)))
+			q.Set("select", "id,ids")
+			var raw openAlexList
+			if err := c.get(cctx, "/works?"+q.Encode(), &raw); err != nil {
+				results[i].err = err
+				cancel()
+				return
 			}
-			p := Paper{PaperID: pid}
-			if w.Ids.DOI != "" {
-				doi := strings.ToLower(strings.TrimPrefix(w.Ids.DOI, "https://doi.org/"))
-				p.ExternalIDs = ExternalIDs{"DOI": doi}
+			papers := make([]Paper, 0, len(raw.Results))
+			for _, w := range raw.Results {
+				pid := stripOpenAlexPrefix(w.ID)
+				if pid == "" {
+					continue
+				}
+				p := Paper{PaperID: pid}
+				if w.Ids.DOI != "" {
+					doi := strings.ToLower(strings.TrimPrefix(w.Ids.DOI, "https://doi.org/"))
+					p.ExternalIDs = ExternalIDs{"DOI": doi}
+				}
+				papers = append(papers, p)
 			}
-			out = append(out, p)
+			results[i].papers = papers
+		}(i, chunk)
+	}
+	wg.Wait()
+
+	// Surface the real error: when one chunk fails it calls cancel(),
+	// which makes sibling in-flight goroutines see context.Canceled.
+	// Returning the first non-nil err in index order would surface that
+	// downstream context.Canceled instead of the upstream cause, so
+	// prefer any non-cancel error over context.Canceled / DeadlineExceeded.
+	out := make([]Paper, 0, len(dois))
+	var firstErr error
+	for _, r := range results {
+		if r.err != nil {
+			if firstErr == nil || (isCtxCancelErr(firstErr) && !isCtxCancelErr(r.err)) {
+				firstErr = r.err
+			}
+			continue
 		}
+		out = append(out, r.papers...)
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return out, nil
+}
+
+func isCtxCancelErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // GetPaperBatch fans the ID list out over /works?filter=openalex:W1|W2|...

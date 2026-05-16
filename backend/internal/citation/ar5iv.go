@@ -52,10 +52,20 @@ func NewAr5ivClient(opts Ar5ivOptions) *Ar5ivClient {
 		opts.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	if opts.RPS == 0 {
-		opts.RPS = 1.0
+		// 5 RPS sustained. ar5iv-labs has no published rate limit and
+		// serves thousands of requests/sec to the rest of the world; one
+		// build issues ≤30 requests over a few-second window, so this
+		// stays well within polite-pool territory even when several dev
+		// instances build in parallel.
+		opts.RPS = 5.0
 	}
 	if opts.Burst == 0 {
-		opts.Burst = 2
+		// Burst 30 absorbs an entire sparse-seed build's worth of recs
+		// in the first wave: the parallel supplement loop in the tertiary
+		// fires N goroutines simultaneously, the limiter hands every one
+		// of them a token immediately, and the wall-clock collapses from
+		// "first 10 + 20/3 s" to network latency only.
+		opts.Burst = 30
 	}
 	return &Ar5ivClient{
 		httpClient: opts.HTTPClient,

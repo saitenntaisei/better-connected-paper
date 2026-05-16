@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -42,6 +43,48 @@ func tryConsumeRefsBudget(ctx context.Context) bool {
 		return true
 	}
 	return atomic.AddInt64(&b.remaining, -1) >= 0
+}
+
+// skipPerPaperSupplementKey signals that the per-paper supplement chain
+// (both ar5iv and paginated /references) should be short-circuited.
+// Builder sets it in deferred-ar5iv mode: the initial response returns
+// without the rate-limited round-trips, and a background goroutine
+// repeats the build with all supplements re-enabled to populate the
+// paper_links cache for the next request.
+type skipPerPaperSupplementKey struct{}
+
+// WithSkipAr5iv attaches a "skip per-paper supplement" signal to ctx —
+// both ar5iv AND S2 paginated /references are bypassed. Despite the
+// name, this affects the whole supplementRefsViaPagination path since
+// the two halves of the chain are both rate-limited per-paper work
+// that the deferred-mode caller wants to push to the background.
+func WithSkipAr5iv(ctx context.Context, skip bool) context.Context {
+	return context.WithValue(ctx, skipPerPaperSupplementKey{}, skip)
+}
+
+func perPaperSupplementSkipped(ctx context.Context) bool {
+	v, _ := ctx.Value(skipPerPaperSupplementKey{}).(bool)
+	return v
+}
+
+// forceSyncAr5ivKey overrides Builder.DeferAr5iv to false for a single
+// call — the deferred-ar5iv background goroutine uses this to break the
+// recursion safely (it calls Builder.Build again to do the work the
+// initial response skipped, and we don't want THAT call to also defer).
+type forceSyncAr5ivKey struct{}
+
+// WithForceSyncAr5iv tells Builder.Build to ignore its DeferAr5iv field
+// for this call: the body runs ar5iv inline. Used by the background
+// goroutine spawned by the deferred mode.
+func WithForceSyncAr5iv(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forceSyncAr5ivKey{}, true)
+}
+
+// IsForceSyncAr5iv reports whether the calling context demands a
+// non-deferred (synchronous) ar5iv pass.
+func IsForceSyncAr5iv(ctx context.Context) bool {
+	v, _ := ctx.Value(forceSyncAr5ivKey{}).(bool)
+	return v
 }
 
 // ResolvingTertiary wraps an inner PaperProvider (typically a Semantic
@@ -139,8 +182,18 @@ func (r *ResolvingTertiary) GetPaper(ctx context.Context, id string, fields []st
 // citers differently, so the paginated tail reliably contains papers the
 // inline response dropped — most visibly the recent-preprint band that makes
 // or breaks the Prior Works cluster in our graph builds.
+//
+// Skipped in deferred-ar5iv mode: the paginated /citations endpoint is
+// 1 RPS S2 and costs ~5 s for a 500-extra fetch on a 1000+ cite seed
+// (Octo). The forced-sync background rerun picks them up before
+// StoreGraph writes the enriched payload, so the user sees a fast
+// initial response capped at the inline 1000 citers and a fully
+// supplemented cluster on the next request.
 func (r *ResolvingTertiary) supplementCiters(ctx context.Context, id string, p *Paper) {
 	if r.CiterSupplementLimit <= 0 || p == nil {
+		return
+	}
+	if perPaperSupplementSkipped(ctx) {
 		return
 	}
 	const inlineCap = 1000
@@ -210,7 +263,14 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 		return papers, err
 	}
 	if requestsReferences(fields) {
-		spent, skipped := 0, 0
+		var wg sync.WaitGroup
+		var spent, skipped atomic.Int32
+		// S2 paginated and ar5iv each enforce their own rate limiter, so
+		// firing every empty-refs paper concurrently lets the two APIs
+		// progress in parallel — wall-clock collapses from
+		// N × (S2_lat + ar5iv_lat) to roughly max(N/S2_RPS, N/ar5iv_RPS).
+		// supplementRefsViaPagination only mutates its own *Paper, so the
+		// goroutines don't race on shared state aside from budget counters.
 		for i := range papers {
 			if len(papers[i].References) > 0 {
 				continue
@@ -220,14 +280,19 @@ func (r *ResolvingTertiary) GetPaperBatch(ctx context.Context, ids []string, fie
 				continue
 			}
 			if !tryConsumeRefsBudget(ctx) {
-				skipped++
+				skipped.Add(1)
 				continue
 			}
-			r.supplementRefsViaPagination(ctx, id, &papers[i], fields)
-			spent++
+			spent.Add(1)
+			wg.Add(1)
+			go func(p *Paper, id string) {
+				defer wg.Done()
+				r.supplementRefsViaPagination(ctx, id, p, fields)
+			}(&papers[i], id)
 		}
-		if skipped > 0 && r.Logger != nil {
-			r.Logger.Info("tertiary: paginated refs fallback budget hit", "spent", spent, "skipped", skipped)
+		wg.Wait()
+		if s := skipped.Load(); s > 0 && r.Logger != nil {
+			r.Logger.Info("tertiary: paginated refs fallback budget hit", "spent", spent.Load(), "skipped", s)
 		}
 	}
 	r.translateRefsBatch(ctx, papers)
@@ -390,6 +455,12 @@ func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id 
 	if p == nil || len(p.References) > 0 || !requestsReferences(fields) {
 		return
 	}
+	if perPaperSupplementSkipped(ctx) {
+		// Deferred-mode caller will redo this work with full supplements
+		// in a background goroutine, then invalidate the cached graph so
+		// the next request rebuilds from the populated paper_links cache.
+		return
+	}
 	pager, hasPager := r.Inner.(referencePager)
 	if !hasPager && r.Ar5iv == nil {
 		return
@@ -397,6 +468,18 @@ func (r *ResolvingTertiary) supplementRefsViaPagination(ctx context.Context, id 
 	if !hasPager {
 		r.fillRefsFromAr5iv(ctx, id, p)
 		return
+	}
+	// For arxiv preprints the publisher-elision rate on S2's paginated
+	// /references is high enough that the per-paper round-trip is
+	// usually wasted — ~30/32 misses in the AsyncVLA cluster. Skip
+	// straight to ar5iv (separate rate limiter, much higher hit rate
+	// for preprints) and only fall back to S2 paginated when ar5iv
+	// didn't deliver. Non-arxiv papers keep the original ordering.
+	if r.Ar5iv != nil && arxivIDFromPaper(p, id) != "" {
+		r.fillRefsFromAr5iv(ctx, id, p)
+		if len(p.References) > 0 {
+			return
+		}
 	}
 	refs, err := pager.GetReferencesSinglePage(ctx, id, []string{"paperId", "externalIds"})
 	if err != nil {
@@ -435,6 +518,12 @@ func (r *ResolvingTertiary) fillRefsFromAr5iv(ctx context.Context, id string, p 
 	if r.Ar5iv == nil || p == nil {
 		return
 	}
+	if perPaperSupplementSkipped(ctx) {
+		// Deferred-ar5iv mode: the caller will rerun this work in the
+		// background after returning the initial response. Skipping here
+		// drops ~5-10 s off the cold sync build for sparse-seed graphs.
+		return
+	}
 	arxivID := arxivIDFromPaper(p, id)
 	if arxivID == "" {
 		return
@@ -469,8 +558,8 @@ func arxivIDFromPaper(p *Paper, id string) string {
 			return a
 		}
 		doi := strings.ToLower(strings.TrimSpace(p.ExternalIDs["DOI"]))
-		if strings.HasPrefix(doi, "10.48550/arxiv.") {
-			return strings.TrimPrefix(doi, "10.48550/arxiv.")
+		if rest, ok := strings.CutPrefix(doi, "10.48550/arxiv."); ok {
+			return rest
 		}
 	}
 	if id != "" {
