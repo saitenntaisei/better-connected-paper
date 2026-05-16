@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/saitenntaisei/better-connected-paper/internal/citation"
@@ -314,8 +315,37 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 		selectedIDs = append(selectedIDs, s.id)
 	}
 
+	// embedder only reads externalIds, which OpenAlex always populates
+	// on every fetch (the client's hard-coded `select` includes `ids`),
+	// so the seed + firstHopByID / bridgesByID maps already carry
+	// everything the SPECTER batch needs. Kick the S2 round-trip off
+	// here so its 3-5 s rate-limited wall time overlaps the parallel
+	// OpenAlex full-fetch instead of stacking sequentially after it.
+	// linkSource (the post-full-fetch source-of-truth) is what the
+	// in-memory citation/biblio edge passes still read; only the
+	// embedder gets this preliminary view.
+	embedderLinks := make(map[string]citation.Paper, len(selectedIDs))
+	embedderLinks[seed.PaperID] = *seed
+	for _, id := range selectedIDs[1:] {
+		if p, ok := firstHopByID[id]; ok {
+			embedderLinks[id] = p
+		} else if p, ok := bridgesByID[id]; ok {
+			embedderLinks[id] = p
+		}
+	}
+	var (
+		embedderWG    sync.WaitGroup
+		embedderEdges []Edge
+	)
+	embedderWG.Add(1)
+	go func() {
+		defer embedderWG.Done()
+		embedderEdges = b.embeddingSimilarityEdges(ctx, selectedIDs, embedderLinks)
+	}()
+
 	full, err := b.fetchWithCache(ctx, selectedIDs[1:], fullNodeFields)
 	if err != nil {
+		embedderWG.Wait()
 		return nil, fmt.Errorf("fetch selected metadata: %w", err)
 	}
 	canonicalizeSeedAlias(full, seedAlias, seed.PaperID)
@@ -393,7 +423,12 @@ func (b *Builder) Build(ctx context.Context, seedID string) (*Response, error) {
 	selectedSet := sliceSet(selectedIDs)
 	edges := buildCiteEdges(selectedIDs, selectedSet, linkSource)
 	edges = append(edges, buildSimilarityEdges(selectedIDs, linkSource, b.SimilarityEdgeThreshold)...)
-	edges = append(edges, b.embeddingSimilarityEdges(ctx, selectedIDs, linkSource)...)
+	// Join the embedder goroutine kicked off before fetchWithCache. Its
+	// edges read externalIds (stable across firstHop/full fetches), so
+	// the parallel result is identical to what a serial call after the
+	// full fetch would have produced.
+	embedderWG.Wait()
+	edges = append(edges, embedderEdges...)
 	edges = dedupeEdges(edges)
 
 	nodes, edges = pruneOrphanNodes(seedNode.ID, nodes, edges)
