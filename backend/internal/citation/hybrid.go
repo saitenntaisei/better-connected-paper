@@ -6,7 +6,19 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"time"
 )
+
+// perLayerSupplementBudget caps each parallel supplement layer's
+// wall-clock time. The OpenCitations layer can legitimately return
+// 30k+ citers for popular DOIs (AlphaFold, Attention Is All You
+// Need); after the JSON download, the DOI→W-ID resolver paginates
+// through OpenAlex and easily blows past a minute. With racing in
+// place, anything still running after this budget is something the
+// parallel tertiary either already filled or will fill faster than
+// the slow secondary, so cancel it and take the best result we have.
+const perLayerSupplementBudget = 15 * time.Second
 
 // PaperProvider is the shape HybridClient routes over. *OpenAlexClient and
 // *Client (Semantic Scholar) both already satisfy this implicitly.
@@ -58,34 +70,76 @@ func (h *HybridClient) GetPaper(ctx context.Context, id string, fields []string)
 		return p, nil
 	}
 
-	// Walk the supplement chain (Secondary → Tertiary). Each layer gets one
-	// shot at direct DOI/arxiv lookup then a title-search fallback; a layer
-	// "wins" only if its merge actually grows refs or resolves a cites gap.
-	// This keeps low-coverage secondaries (e.g. OpenCitations returning a
-	// shorter cites list than OpenAlex already has) from short-circuiting
-	// the tertiary that would have filled the real gap. Hard errors in one
-	// layer don't block later layers — a sick secondary shouldn't veto a
-	// healthy tertiary.
+	// Race the supplement chain (Secondary || Tertiary) in parallel.
+	// The first layer to return a narrowing merge cancels its peers so
+	// a slow OpenCitations resolver chasing 32k citers on AlphaFold
+	// can't keep dragging out the FG seed-fetch after S2 already filled
+	// the gap. Sequential walks were costing 6–15 s on Octo and 120+ s
+	// on AlphaFold; first-success-wins keeps the wall-clock at the
+	// fastest layer's response time.
 	current := p
 	skipSecondary := isArxivPaper(current)
-	for _, layer := range h.supplementChain() {
-		if !h.needsSupplement(current, fields) {
-			break
-		}
+	chain := h.supplementChain()
+	results := make([]*Paper, len(chain))
+	cancels := make([]context.CancelFunc, len(chain))
+	var (
+		wg         sync.WaitGroup
+		cancelOnce sync.Once
+	)
+	cancelLosers := func(winner int) {
+		cancelOnce.Do(func() {
+			for j, c := range cancels {
+				if j != winner && c != nil {
+					c()
+				}
+			}
+		})
+	}
+	for i, layer := range chain {
 		if skipSecondary && layer.label == "secondary" {
 			// OpenCitations doesn't index arxiv preprints — every
-			// secondary call on an arxiv DOI returns "non-narrowing" and
-			// just costs a serial round-trip on the seed-fetch path.
-			// Skip ahead so tertiary (S2 + ar5iv) starts ~1-2 s sooner.
+			// secondary call on an arxiv DOI returns "non-narrowing"
+			// and just costs S2 a parallel token for no gain.
 			continue
 		}
-		if merged := h.trySupplement(ctx, current, id, fields, layer.provider, layer.label); merged != nil {
-			current = merged
+		layerCtx, cancel := context.WithTimeout(ctx, perLayerSupplementBudget)
+		cancels[i] = cancel
+		wg.Add(1)
+		go func(i int, layer supplementLayer, layerCtx context.Context) {
+			defer wg.Done()
+			results[i] = h.trySupplement(layerCtx, p, id, fields, layer.provider, layer.label)
+			if results[i] != nil {
+				cancelLosers(i)
+			}
+		}(i, layer, layerCtx)
+	}
+	wg.Wait()
+	for _, c := range cancels {
+		if c != nil {
+			c()
 		}
+	}
+	for _, merged := range results {
+		if merged == nil {
+			continue
+		}
+		// Each surviving result is already (primary ∪ layer-data) per
+		// trySupplement's applyMerge. Union them so a late secondary
+		// with a bigger refs list still contributes if it landed
+		// before being cancelled.
+		current = mergeFromSecondary(current, merged)
 	}
 
 	if current == p && h.Logger != nil {
-		h.Logger.Warn("hybrid: no supplement match found", "id", id, "title", p.Title)
+		// In defer-ar5iv mode the chain is intentionally short-circuited
+		// after direct lookup, so the "no match" outcome there reflects
+		// policy, not a missing index. Use an INFO-level message that
+		// names the policy so the warn channel stays for real misses.
+		if perPaperSupplementSkipped(ctx) {
+			h.Logger.Info("hybrid: supplement deferred (direct lookup only)", "id", id, "title", p.Title)
+		} else {
+			h.Logger.Warn("hybrid: no supplement match found", "id", id, "title", p.Title)
+		}
 	}
 	return current, nil
 }
@@ -172,6 +226,17 @@ func (h *HybridClient) trySupplement(ctx context.Context, primary *Paper, id str
 				return nil
 			}
 		}
+	}
+	// Deferred-ar5iv FG: cap the supplement chain at the single direct
+	// lookup. The two remaining paths (arxiv-sibling probe and byTitle
+	// fallback) each cost 2 sequential S2 calls = ~6 s at the anonymous
+	// 1-req/3-s rate, which dominated the perf tail for arxiv preprints
+	// whose direct DOI lookup missed (e.g. word2vec, LAPGAN seed fetches
+	// at 13 s). The forced-sync BG rerun re-enters this path with the
+	// flag off and persists the enriched paper_links so the next FG
+	// gets a cache hit before the chain ever runs again.
+	if perPaperSupplementSkipped(ctx) {
+		return nil
 	}
 	// Direct lookup missed — for published arxiv preprints the primary DOI is
 	// often a conference/proceedings DOI that S2 doesn't index, while S2 DOES

@@ -423,7 +423,12 @@ func TestHybridTertiaryFillsGapWhenSecondaryEmpty(t *testing.T) {
 	}
 }
 
-func TestHybridTertiarySkippedWhenSecondarySucceeds(t *testing.T) {
+func TestHybridSupplementPicksBetterOfParallelLayers(t *testing.T) {
+	// With the parallel-supplement refactor the chain no longer
+	// short-circuits when secondary narrows — both layers fire and the
+	// broader refs/cites list wins. Verify (1) both providers were
+	// called, and (2) tertiary's longer list survives the merge even
+	// though secondary also returned data.
 	primary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
 		return &Paper{
 			PaperID:        "W1",
@@ -434,9 +439,10 @@ func TestHybridTertiarySkippedWhenSecondarySucceeds(t *testing.T) {
 	secondary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
 		return &Paper{References: []Paper{{PaperID: "W_a"}, {PaperID: "W_b"}}}, nil
 	}}
+	tertiaryCalls := 0
 	tertiary := &stubProvider{getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
-		t.Fatalf("tertiary must not be called when secondary filled the gap")
-		return nil, nil
+		tertiaryCalls++
+		return &Paper{References: []Paper{{PaperID: "W_c"}, {PaperID: "W_d"}, {PaperID: "W_e"}}}, nil
 	}}
 
 	h := &HybridClient{Primary: primary, Secondary: secondary, Tertiary: tertiary}
@@ -444,8 +450,11 @@ func TestHybridTertiarySkippedWhenSecondarySucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.References) != 2 {
-		t.Fatalf("expected secondary refs, got %d", len(p.References))
+	if tertiaryCalls == 0 {
+		t.Fatalf("tertiary must run in parallel even when secondary returns data")
+	}
+	if len(p.References) != 3 {
+		t.Fatalf("tertiary's longer ref list must win the merge, got %d", len(p.References))
 	}
 }
 
@@ -589,6 +598,100 @@ func TestHybridTertiaryFallsBackToArxivSibling(t *testing.T) {
 	}
 	if len(tertiaryLookups) < 2 || tertiaryLookups[len(tertiaryLookups)-1] != "DOI:10.48550/arxiv.2405.12213" {
 		t.Fatalf("expected arxiv sibling lookup after primary DOI miss, got %v", tertiaryLookups)
+	}
+}
+
+func TestHybridDeferSkipsSiblingAndTitleFallback(t *testing.T) {
+	// Deferred-ar5iv mode: trySupplement must stop after the direct DOI
+	// lookup. The arxiv-sibling probe (which costs a primary Search) and
+	// the byTitle fallback (two sequential tertiary calls) are the slow
+	// paths the optimization removes from the foreground.
+	primary := &stubProvider{
+		getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:     "W_rss",
+				Title:       "Octo: An Open-Source Generalist Robot Policy",
+				Year:        2024,
+				ExternalIDs: ExternalIDs{"DOI": "10.15607/rss.2024.xx.090"},
+			}, nil
+		},
+		search: func(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error) {
+			t.Fatalf("primary search must not fire when defer flag is set (arxivSiblingLookup skipped)")
+			return nil, nil
+		},
+	}
+	var tertiaryLookups []string
+	tertiary := &stubProvider{
+		getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			tertiaryLookups = append(tertiaryLookups, id)
+			// Direct lookup misses; in defer mode the chain returns nil
+			// here without walking sibling/title.
+			return nil, ErrNotFound
+		},
+		search: func(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error) {
+			t.Fatalf("tertiary search must not fire when defer flag is set (byTitle skipped)")
+			return nil, nil
+		},
+	}
+
+	h := &HybridClient{Primary: primary, Tertiary: tertiary}
+	ctx := WithSkipAr5iv(context.Background(), true)
+	p, err := h.GetPaper(ctx, "W_rss", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.PaperID != "W_rss" {
+		t.Fatalf("expected primary paper returned untouched, got %+v", p)
+	}
+	if len(p.References) != 0 {
+		t.Fatalf("expected zero merged refs (defer skips fallbacks), got %d", len(p.References))
+	}
+	if len(tertiaryLookups) != 1 || tertiaryLookups[0] != "DOI:10.15607/rss.2024.xx.090" {
+		t.Fatalf("expected single direct-DOI tertiary call, got %v", tertiaryLookups)
+	}
+}
+
+func TestHybridDeferOffStillWalksFallbacks(t *testing.T) {
+	// Mirror of the defer-skip test with the flag absent: trySupplement
+	// must still walk sibling+byTitle. Pins the contract so a future
+	// edit that flips the gate doesn't silently regress the non-defer
+	// path used by the background ar5iv re-run.
+	primary := &stubProvider{
+		getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			return &Paper{
+				PaperID:     "W_rss",
+				Title:       "Octo: An Open-Source Generalist Robot Policy",
+				Year:        2024,
+				ExternalIDs: ExternalIDs{"DOI": "10.15607/rss.2024.xx.090"},
+			}, nil
+		},
+		search: func(ctx context.Context, q string, limit int, fields []string) (*SearchResponse, error) {
+			return &SearchResponse{Data: []Paper{
+				{PaperID: "W_arxiv", Title: "Octo: An Open-Source Generalist Robot Policy", Year: 2024, ExternalIDs: ExternalIDs{"DOI": "10.48550/arxiv.2405.12213"}},
+			}}, nil
+		},
+	}
+	var tertiaryLookups []string
+	tertiary := &stubProvider{
+		getPaper: func(ctx context.Context, id string, fields []string) (*Paper, error) {
+			tertiaryLookups = append(tertiaryLookups, id)
+			if id == "DOI:10.48550/arxiv.2405.12213" {
+				return &Paper{References: []Paper{{PaperID: "W_r1"}}}, nil
+			}
+			return nil, ErrNotFound
+		},
+	}
+
+	h := &HybridClient{Primary: primary, Tertiary: tertiary}
+	p, err := h.GetPaper(context.Background(), "W_rss", []string{"paperId", "references.paperId"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.References) != 1 {
+		t.Fatalf("expected sibling fallback to populate refs, got %d", len(p.References))
+	}
+	if len(tertiaryLookups) < 2 {
+		t.Fatalf("expected sibling lookup to extend tertiary calls, got %v", tertiaryLookups)
 	}
 }
 
