@@ -81,7 +81,22 @@ func (h *HybridClient) GetPaper(ctx context.Context, id string, fields []string)
 	skipSecondary := isArxivPaper(current)
 	chain := h.supplementChain()
 	results := make([]*Paper, len(chain))
+	layerCtxs := make([]context.Context, len(chain))
 	cancels := make([]context.CancelFunc, len(chain))
+	// Pre-build every layer's ctx+cancel BEFORE launching any goroutine.
+	// cancelLosers walks `cancels` from inside the per-layer goroutine,
+	// and a winner racing the next iteration's `cancels[i+1] = cancel`
+	// write trips -race. Splitting into write-then-read phases lets the
+	// goroutines treat the slice as read-only.
+	for i, layer := range chain {
+		if skipSecondary && layer.label == "secondary" {
+			// OpenCitations doesn't index arxiv preprints — every
+			// secondary call on an arxiv DOI returns "non-narrowing"
+			// and just costs S2 a parallel token for no gain.
+			continue
+		}
+		layerCtxs[i], cancels[i] = context.WithTimeout(ctx, perLayerSupplementBudget)
+	}
 	var (
 		wg         sync.WaitGroup
 		cancelOnce sync.Once
@@ -96,22 +111,17 @@ func (h *HybridClient) GetPaper(ctx context.Context, id string, fields []string)
 		})
 	}
 	for i, layer := range chain {
-		if skipSecondary && layer.label == "secondary" {
-			// OpenCitations doesn't index arxiv preprints — every
-			// secondary call on an arxiv DOI returns "non-narrowing"
-			// and just costs S2 a parallel token for no gain.
+		if cancels[i] == nil {
 			continue
 		}
-		layerCtx, cancel := context.WithTimeout(ctx, perLayerSupplementBudget)
-		cancels[i] = cancel
 		wg.Add(1)
-		go func(i int, layer supplementLayer, layerCtx context.Context) {
+		go func(i int, layer supplementLayer) {
 			defer wg.Done()
-			results[i] = h.trySupplement(layerCtx, p, id, fields, layer.provider, layer.label)
+			results[i] = h.trySupplement(layerCtxs[i], p, id, fields, layer.provider, layer.label)
 			if results[i] != nil {
 				cancelLosers(i)
 			}
-		}(i, layer, layerCtx)
+		}(i, layer)
 	}
 	wg.Wait()
 	for _, c := range cancels {
