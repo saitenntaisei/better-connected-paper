@@ -48,10 +48,23 @@ func (db *DB) GetPaperLinks(ctx context.Context, paperIDs []string) (map[string]
 // ReplacePaperLinks rewrites the link rows for paperID in one transaction
 // and stamps papers.links_fetched_at = now(). The caller is expected to
 // have upserted the papers row already (via UpsertPapers).
+//
+// Refs and cites are filtered through filterBogusIDs first: OpenAlex's
+// `referenced_works` arrays occasionally contain upstream-corrupt
+// targets (verified MizAR / Aion cases — see knownBogusWorkIDs), and
+// persisting those edges would let future builds see them as 2-hop
+// bridge candidates regardless of how the graph scorer is tuned.
 func (db *DB) ReplacePaperLinks(ctx context.Context, paperID string, refs, cites []string) error {
 	if db == nil || db.Pool == nil || paperID == "" {
 		return nil
 	}
+	if _, bogus := knownBogusWorkIDs[paperID]; bogus {
+		// Don't persist links FROM a known-bogus paper either; the
+		// caller (UpsertPapers) already skips inserting the row.
+		return nil
+	}
+	refs = filterBogusIDs(refs)
+	cites = filterBogusIDs(cites)
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
 		return err
