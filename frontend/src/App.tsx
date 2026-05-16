@@ -15,7 +15,10 @@ export default function App() {
   const { state: graphState, build } = useGraph();
   const { seed: urlSeed, setSeed: setUrlSeed, hasPushedEntry } = useUrlSeed();
 
-  const [focusId, setFocusId] = useState<string | null>(urlSeed);
+  // null = "no explicit selection, show the current graph's seed".
+  // The detail pane resolves this lazily below — preferring the canonical
+  // seed id once the graph loads, with the raw URL alias as fallback.
+  const [focusId, setFocusId] = useState<string | null>(null);
   const [showSimilarity, setShowSimilarity] = useState(true);
 
   // Reset the detail-panel focus whenever the seed changes — including the
@@ -23,7 +26,7 @@ export default function App() {
   const [prevUrlSeed, setPrevUrlSeed] = useState(urlSeed);
   if (urlSeed !== prevUrlSeed) {
     setPrevUrlSeed(urlSeed);
-    setFocusId(urlSeed);
+    setFocusId(null);
   }
 
   useEffect(() => {
@@ -38,11 +41,12 @@ export default function App() {
     [setUrlSeed],
   );
 
-  // The backend canonicalizes seed aliases (e.g. DOI → OpenAlex W-id), so the
-  // rendered seed node's id may not equal the raw `?seed=` string. Compare
-  // against the canonical seed id too, or else dbl-clicking the seed node of a
-  // DOI-linked graph would push a redundant history entry and re-POST
-  // /graph/build.
+  // The backend canonicalizes seed aliases (e.g. DOI → OpenAlex W-id), so
+  // the rendered seed node's id may not equal the raw `?seed=` string.
+  // Use the canonical id (when the graph has loaded) for both the dbl-click
+  // no-op check and the detail-pane id resolution below. Without this, the
+  // detail pane would hit /api/paper/{alias} and miss the backend's
+  // exact-keyed paper cache on every cached/Back restore.
   const canonicalSeedId =
     graphState.status === "success" ? graphState.data.seed.id : null;
   const rebuildFromNode = useCallback(
@@ -52,6 +56,14 @@ export default function App() {
     },
     [urlSeed, canonicalSeedId, setUrlSeed],
   );
+
+  // The id we hand to PaperDetail:
+  //   1. explicit user selection wins (focusId set via Graph.onSelectNode)
+  //   2. else the canonical seed id once the graph resolves — guarantees a
+  //      backend paper-cache hit and keeps the sidebar alive when the graph
+  //      itself was restored from in-memory cache during a provider outage
+  //   3. else the raw URL alias as initial fallback before the graph loads
+  const detailId = focusId ?? canonicalSeedId ?? urlSeed;
 
   const loading = searchState.status === "loading";
   const results = useMemo(
@@ -124,7 +136,7 @@ export default function App() {
           </div>
           <aside className="graph-side">
             <Legend yearRange={yearRange} />
-            <PaperDetail id={focusId} />
+            <PaperDetail id={detailId} />
           </aside>
         </div>
       </main>

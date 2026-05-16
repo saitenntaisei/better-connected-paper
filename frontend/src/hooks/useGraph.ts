@@ -11,11 +11,19 @@ export type GraphState =
 export function useGraph() {
   const [state, setState] = useState<GraphState>({ status: "idle" });
   const abortRef = useRef<AbortController | null>(null);
-  // Per-session cache keyed by seedId. Lets browser Back/Forward through
-  // drilled-in graphs restore instantly, and survives transient API outages
-  // for seeds already fetched this session. fresh=true (retry button)
-  // bypasses the cache intentionally.
-  const cacheRef = useRef<Map<string, GraphResponse>>(new Map());
+  // Per-session graph cache. Two-level so the same paper has a single
+  // payload no matter which alias the user reaches it through:
+  //   - byCanonical: canonical seed id → GraphResponse
+  //   - aliasToCanonical: any lookup key (raw user input, DOI, canonical
+  //     id) → canonical seed id
+  // A fresh rebuild from any alias overwrites the canonical entry, so
+  // every prior alias starts seeing the refreshed graph. Without this
+  // indirection, Retry from the canonical URL would leave the DOI
+  // alias serving the stale snapshot on Back/Forward.
+  const cacheRef = useRef<{
+    byCanonical: Map<string, GraphResponse>;
+    aliasToCanonical: Map<string, string>;
+  }>({ byCanonical: new Map(), aliasToCanonical: new Map() });
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -24,7 +32,10 @@ export function useGraph() {
     if (!trimmed) return;
     abortRef.current?.abort();
     if (!fresh) {
-      const cached = cacheRef.current.get(trimmed);
+      const canonical = cacheRef.current.aliasToCanonical.get(trimmed);
+      const cached = canonical
+        ? cacheRef.current.byCanonical.get(canonical)
+        : undefined;
       if (cached) {
         setState({ status: "success", seedId: trimmed, data: cached });
         return;
@@ -36,13 +47,10 @@ export function useGraph() {
     try {
       const data = await buildGraph(trimmed, fresh, { signal: ctl.signal });
       if (ctl.signal.aborted) return;
-      cacheRef.current.set(trimmed, data);
-      // The backend canonicalizes the seed id (e.g. DOI → W-id), so alias the
-      // cache under both the raw lookup key and the canonical id. That way a
-      // later build() call keyed by either form restores from memory.
-      if (data.seed.id && data.seed.id !== trimmed) {
-        cacheRef.current.set(data.seed.id, data);
-      }
+      const canonicalId = data.seed.id || trimmed;
+      cacheRef.current.byCanonical.set(canonicalId, data);
+      cacheRef.current.aliasToCanonical.set(trimmed, canonicalId);
+      cacheRef.current.aliasToCanonical.set(canonicalId, canonicalId);
       setState({ status: "success", seedId: trimmed, data });
     } catch (err) {
       if (ctl.signal.aborted) return;

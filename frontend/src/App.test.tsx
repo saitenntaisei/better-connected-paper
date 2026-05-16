@@ -193,6 +193,43 @@ describe("App", () => {
     expect(buildCalls).toEqual(["first", "A"]);
   });
 
+  it("PaperDetail switches to the canonical seed id once the graph resolves", async () => {
+    const paperCalls: string[] = [];
+    globalThis.fetch = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/graph/build") {
+          // Backend canonicalizes the DOI seed alias.
+          return json({
+            seed: { id: "W123", title: "canonical paper", similarity: 0, isSeed: true },
+            nodes: [],
+            edges: [],
+            builtAt: "2026-04-18T00:00:00Z",
+          });
+        }
+        if (url.startsWith("/api/paper/")) {
+          const id = decodeURIComponent(url.replace(/^\/api\/paper\//, ""));
+          paperCalls.push(id);
+          return json({ paperId: id, title: `paper-${id}` });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+    window.history.replaceState({}, "", "/?seed=doi:10.1038/xyz");
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("graph-stub")).toHaveTextContent("graph:canonical paper");
+    });
+    // Once the graph response surfaces canonical "W123", the detail pane must
+    // re-target it. Without this, the sidebar would keep asking
+    // /api/paper/doi:10.1038/xyz on every Back-restore — guaranteed cache
+    // miss on the backend's exact-keyed paper cache.
+    await waitFor(() => {
+      expect(paperCalls).toContain("W123");
+    });
+  });
+
   it("double-clicking the current seed node is a no-op for canonicalized aliases", async () => {
     const buildCalls: string[] = [];
     globalThis.fetch = vi
