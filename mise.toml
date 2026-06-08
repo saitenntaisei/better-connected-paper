@@ -1,6 +1,6 @@
 [tools]
-go = "1.25"
-node = "22"
+go = "1.26.4"
+node = "26.3.0"
 
 [env]
 _.file = [".env"]
