@@ -637,6 +637,17 @@ func requestsReferences(fields []string) bool {
 	return false
 }
 
+// NormalizeTitle lowercases, drops non-alphanumeric runes, and collapses
+// whitespace so two titles equal each other iff they're a strict text match
+// ignoring punctuation/case. Used for the secondary title-search fallback,
+// where a near-match ("Octo:" vs "Octo") should still be a hit. Exported so
+// the graph package can dedupe seed-aliased OpenAlex W-ids (one paper indexed
+// as both an RSS conference work and an arxiv sibling work) before they
+// poison the candidate ranking with a near-1.0 self-similarity score.
+func NormalizeTitle(s string) string {
+	return normalizeTitle(s)
+}
+
 // normalizeTitle lowercases, drops non-alphanumeric runes, and collapses
 // whitespace so two titles equal each other iff they're a strict text match
 // ignoring punctuation/case. Used for the secondary title-search fallback,
