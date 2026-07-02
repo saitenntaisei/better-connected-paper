@@ -10,6 +10,66 @@ import (
 	"github.com/saitenntaisei/better-connected-paper/internal/citation"
 )
 
+// knownBogusWorkIDs holds OpenAlex Works whose referenced_works arrays
+// are demonstrably corrupt upstream — running:
+//
+//	curl https://api.openalex.org/works/W4385430679?select=referenced_works
+//
+// lists W4385245566 ("MizAR 60 for Mizar 50") inside RT-1's references,
+// even though the real paper is interactive theorem proving and the
+// real cited_by_count is sub-100, not the 75670 OpenAlex returns. Same
+// pattern for Aion Framework (W4292779060): inflated cited_by_count
+// (14188) and false referenced_works edges in unrelated robotics
+// papers. The runtime cap on rankingBonus (graph.cappedRankingBonus)
+// already keeps these from surfacing as graph nodes, but filtering
+// at the store boundary is also necessary: otherwise every fresh
+// build re-fetches RT-1 from OpenAlex, sees MizAR in its refs, and
+// writes the bogus edge back to paper_links, polluting 2-hop support
+// counting on future graphs.
+//
+// Keep this list narrow and append-only. Each entry should be backed
+// by an independent verification step (the OpenAlex direct query
+// above, plus a sanity check against Semantic Scholar's view of the
+// same paper).
+var knownBogusWorkIDs = map[string]struct{}{
+	"W4385245566": {}, // "MizAR 60 for Mizar 50" — math theorem proving; real cc ≤100
+	"W4292779060": {}, // "Aion Framework: Dimensional Emergence of AI Consciousness..." — fringe physics
+}
+
+// IsKnownBogusWorkID reports whether id is on the upstream-corruption
+// denylist. Exported so the build pipeline (or future admin tooling)
+// can mirror the cache-write filter without re-declaring the list.
+func IsKnownBogusWorkID(id string) bool {
+	_, ok := knownBogusWorkIDs[id]
+	return ok
+}
+
+// filterBogusIDs drops any IDs on the upstream-corruption denylist
+// (knownBogusWorkIDs). Used by ReplacePaperLinks before persisting
+// refs/cites so OpenAlex's bogus referenced_works entries can't make
+// it into our cache. Returns the input slice unchanged when nothing
+// is filtered so the common path avoids an allocation.
+func filterBogusIDs(ids []string) []string {
+	keep := true
+	for _, id := range ids {
+		if _, bad := knownBogusWorkIDs[id]; bad {
+			keep = false
+			break
+		}
+	}
+	if keep {
+		return ids
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, bad := knownBogusWorkIDs[id]; bad {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
 // GetPaper returns a single cached paper; ErrNotFound if missing.
 func (db *DB) GetPaper(ctx context.Context, id string) (*citation.Paper, error) {
 	papers, err := db.GetPapers(ctx, []string{id})
@@ -93,6 +153,11 @@ func (db *DB) UpsertPapers(ctx context.Context, papers []citation.Paper) error {
 	batch := &pgx.Batch{}
 	for _, p := range papers {
 		if p.PaperID == "" {
+			continue
+		}
+		if _, bogus := knownBogusWorkIDs[p.PaperID]; bogus {
+			// Skip upstream-corrupt OpenAlex Works (MizAR / Aion) so a
+			// fresh fetch can't re-pollute the cache. See knownBogusWorkIDs.
 			continue
 		}
 		authorsJSON, err := json.Marshal(p.Authors)
